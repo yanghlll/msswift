@@ -70,7 +70,16 @@ msswift-docker/
 所以在宿主机上编辑 `./ms-swift/` 下的任何 Python 文件，容器内下一次运行即生效。
 模型缓存挂载在宿主机 `~/.cache/huggingface` 和 `~/.cache/modelscope`，删除容器不丢模型。
 
-数据盘按需在 `docker-compose.yml` 的 `volumes` 中添加挂载。
+**跑其他项目的代码 / 挂载更多目录**：容器只能看到挂载进去的目录。用 `EXTRA_MOUNT`
+把宿主机目录以相同路径挂进容器（逗号分隔多个），重跑 `start.sh` 即可（镜像有缓存，秒级重建容器）：
+
+```bash
+EXTRA_MOUNT=/root/zlx_workspace,/data bash start.sh
+```
+
+这样容器内 `cd /root/zlx_workspace/xxx` 与宿主机路径完全一致。
+用 compose 启动的话，直接在 `docker-compose.yml` 的 `volumes` 里加 `- /root/zlx_workspace:/root/zlx_workspace`。
+注意：重跑 `start.sh` 会重建容器，如果里面有正在跑的训练请先等它结束。
 
 ## 最简测试
 
