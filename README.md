@@ -18,7 +18,10 @@ ms-swift 训练环境的一键 Docker 部署。**镜像只提供环境**，ms-sw
 
 ## 前置条件
 
-目标服务器需要 Docker + nvidia-container-toolkit，验证：
+目标服务器需要 Docker（≥19.03，支持 `--gpus`）+ nvidia-container-toolkit。
+`start.sh` 会自动检测 docker compose v2：有则用 compose，没有则回退到原生 `docker run`，两者行为一致。
+
+验证 GPU 容器运行时：
 
 ```bash
 docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu22.04 nvidia-smi
