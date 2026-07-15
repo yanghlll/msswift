@@ -1,0 +1,1 @@
+{"loss": 2.01100802, "grad_norm": 1.16225338, "learning_rate": 9.045e-05, "token_acc": 0.5571161, "epoch": 0.00499064, "global_step/max_steps": "1/5", "elapsed_time": "1m 41s", "remaining_time": "6m 45s", "memory(GiB)": 74.58, "train_speed(s/it)": 101.292509}
