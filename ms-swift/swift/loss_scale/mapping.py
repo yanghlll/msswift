@@ -2,6 +2,7 @@
 from .agent import AgentFlanLossScale, AlphaUmiLossScale, HermesLossScale, QwenLossScale, REACTLossScale
 from .base import ALL_BASE_STRATEGY, ConcatLossScale, LossScale
 from .other import IgnoreEmptyThinkLossScale
+from .streaming import JoyStreamingLossScale
 
 # Add your loss scale here, use --loss_scale xxx to train
 loss_scale_map = {
@@ -13,6 +14,8 @@ loss_scale_map = {
     'qwen': QwenLossScale,
     'agentflan': AgentFlanLossScale,
     'alpha_umi': AlphaUmiLossScale,
+    # streaming
+    'joy_streaming': JoyStreamingLossScale,
 }
 
 

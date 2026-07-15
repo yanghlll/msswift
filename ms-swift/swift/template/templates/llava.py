@@ -426,6 +426,9 @@ class LLavaOneVision2Template(Template):
     placeholder_tokens = ['<|image_pad|>', '<|video_pad|>']
     use_model = True
     support_padding_free = False
+    # chat_template.jinja 为每个视频产出的占位块。codec 后端把整块重写为
+    # <X.X seconds><|vision_start|><|image_pad|>*n<|vision_end|>\n 序列
+    VIDEO_BLOCK = '<|vision_start|><|video_pad|><|vision_end|>'
  
     # ------------------------------------------------------------------ env
  
@@ -437,6 +440,11 @@ class LLavaOneVision2Template(Template):
         self.num_frames: Optional[int] = get_env_args('NUM_FRAMES', int, None)
         self.max_frames: Optional[int] = get_env_args('VIDEO_MAX_FRAMES', int, None)
         self.target_fps: Optional[float] = get_env_args('FPS', float, None)
+        # 与官方 processor 的 video_backend 参数同名同默认值:
+        # frames = 帧采样 VideoProcessor; codec = cv-preinfer 码流选帧
+        self.video_backend: str = get_env_args('VIDEO_BACKEND', str, 'frames').lower()
+        assert self.video_backend in {'frames', 'codec'}, \
+            f'VIDEO_BACKEND 仅支持 frames / codec, 得到 {self.video_backend!r}'
  
     # -------------------------------------------------- 官方模块函数的获取
  
@@ -485,7 +493,7 @@ class LLavaOneVision2Template(Template):
         # 混排防线一（另一半在 _encode 的 IMAGE PATH assert）:
         # 官方 IMAGE PATH 按出现顺序消费 image_pad, 视频重写产生的 image_pad 会被误消费
         assert not inputs.images, 'llava_onevision2 v1: 暂不支持同一样本中图像与视频混用'
-        return ['<|vision_start|><|video_pad|><|vision_end|>']
+        return [self.VIDEO_BLOCK]
  
     # -------------------------------------------------- grounding（沿用 1.5;
     # 注意 grounding 训练属 v1 未验证功能: 裸调 image_processor 后 resize 发生在
