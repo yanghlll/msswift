@@ -1,4 +1,2 @@
-# ms-swift 源码由 start.sh 在部署机上 clone，不入库
-ms-swift/
 # 训练输出
 workdir/
