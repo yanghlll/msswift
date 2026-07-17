@@ -180,6 +180,7 @@ class MLLMTemplateType:
     llama3_llava_next = 'llama3_llava_next'
     llava_onevision1_5 = 'llava_onevision1_5'
     llava_onevision2 = 'llava_onevision2'
+    llava_onevision2_streaming = 'llava_onevision2_streaming'
 
     yi_vl = 'yi_vl'
     ernie_vl = 'ernie_vl'

@@ -1,0 +1,177 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
+"""Preprocessor for JoyAI-VL-Interaction streaming-video-understanding data.
+
+Converts a raw JoyAI row::
+
+    {"video_name", "video_path", "task_type", "source",
+     "question": [{"content", "time"}], "response": [{"content", "time"}]}
+
+into per-second interleaved turns **without extracting frames to disk**. The
+video is left as a single ``videos: [path]`` entry and decoded on the fly by
+``LLavaOneVision2StreamingTemplate`` (frames-sample backend). This mirrors
+``JoyAI-VL-Interaction/datasets/convert_data.py::convert_sample`` but keeps the
+video instead of writing ``frame_XXXXXX.jpg`` + ``images: [...]``.
+
+Per second ``sec`` in ``[0, n_seconds)``:
+  - user turn: ``"[<question>\\n]<sec.0 seconds>\\n<|video_pad|>"`` — exactly one
+    ``<|video_pad|>`` sentinel; the template splices that second's decoded frame
+    tokens in its place.
+  - assistant turn: ``"</response> <answer>"`` if a response fires at ``sec``,
+    else ``"</silence>"``.
+
+fps is duration-adaptive (>=160s -> 1, >=64s -> 2, else 4), matching JoyAI.
+Metadata the template needs (fps / n_seconds / frames_per_sec) rides in
+``chat_template_kwargs`` — the only non-media row field that survives
+``RowPreprocessor.remove_useless_columns``.
+"""
+import subprocess
+from typing import Any, Dict, List, Optional
+
+from swift.utils import get_logger
+from .core import RowPreprocessor
+
+logger = get_logger()
+
+# per-second visual placeholder: reuse the model's own <|video_pad|> token, which
+# is already a single vocab token AND a truncation-protected placeholder_token.
+STREAM_FRAME_TAG = '<|video_pad|>'
+
+
+def _ffprobe_duration(video_path: str) -> float:
+    """Video duration in seconds via ffprobe (0.0 on failure). Mirrors
+    convert_data.get_video_duration without the threaded cache."""
+    try:
+        result = subprocess.run(
+            ['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration',
+             '-of', 'default=noprint_wrappers=1:nokey=1', video_path],
+            capture_output=True, text=True)
+        return float(result.stdout.strip())
+    except (ValueError, AttributeError, OSError):
+        return 0.0
+
+
+def _parse_times(time_str) -> List[int]:
+    """'8' or '5,6,7' -> [8] / [5,6,7] (mirrors convert_data.parse_times)."""
+    if not time_str and time_str != 0:
+        return []
+    return [int(float(t.strip())) for t in str(time_str).split(',') if str(t).strip()]
+
+
+class JoyStreamingVideoPreprocessor(RowPreprocessor):
+
+    def __init__(self, *, max_duration: int = 320, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.max_duration = max_duration
+
+    @staticmethod
+    def _adaptive_fps(duration: float) -> float:
+        if duration >= 160:
+            return 1.0
+        elif duration >= 64:
+            return 2.0
+        return 4.0
+
+    def preprocess(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        video_path = row.get('video_path') or (row.get('videos') or [None])[0]
+        if not video_path:
+            return None
+        duration = _ffprobe_duration(video_path)
+        if duration <= 0:
+            logger.warning_once(f'ffprobe duration<=0, skipping: {video_path}', hash_id='joy_stream_dur')
+            return None
+
+        fps = self._adaptive_fps(duration)
+        frames_per_sec = max(int(fps), 1)
+        if self.max_duration and self.max_duration > 0:
+            truncated = duration > self.max_duration
+            effective_duration = min(duration, self.max_duration)
+        else:
+            truncated = False
+            effective_duration = duration
+        n_seconds = max(int(effective_duration), 1)
+
+        # second_idx -> text
+        question_map: Dict[int, str] = {}
+        for q in row.get('question') or []:
+            for t in _parse_times(q.get('time')):
+                if t > effective_duration:
+                    if truncated:
+                        continue
+                    return None  # question past end of an un-truncated video -> bad row
+                question_map[min(t, n_seconds - 1)] = q['content']
+
+        response_map: Dict[int, str] = {}
+        raw_responses = row.get('response') or []
+        flat: List[Dict[str, Any]] = []
+        for item in raw_responses:
+            flat.extend(item) if isinstance(item, list) else flat.append(item)
+        for r in flat:
+            for t in _parse_times(r.get('time')):
+                if t > effective_duration:
+                    if truncated:
+                        continue
+                    return None
+                response_map[min(t, n_seconds - 1)] = r['content']
+
+        messages: List[Dict[str, str]] = []
+        for sec in range(n_seconds):
+            parts = []
+            if sec in question_map:
+                parts.append(question_map[sec])
+            parts.append(f'<{sec:.1f} seconds>')
+            parts.append(STREAM_FRAME_TAG)  # exactly one sentinel per second
+            messages.append({'role': 'user', 'content': '\n'.join(parts)})
+            if sec in response_map:
+                messages.append({'role': 'assistant', 'content': f'</response> {response_map[sec]}'})
+            else:
+                messages.append({'role': 'assistant', 'content': '</silence>'})
+
+        return {
+            'messages': messages,
+            'videos': [video_path],
+            'chat_template_kwargs': {
+                'stream_fps': fps,
+                'stream_n_seconds': n_seconds,
+                'stream_frames_per_sec': frames_per_sec,
+                'stream_max_duration': self.max_duration,
+            },
+        }
+
+
+def register_joy_streaming_dataset(dataset_path: str, *, name: str = 'joy_streaming_video',
+                                   max_duration: int = 320, pattern: str = '**/*.jsonl') -> None:
+    """把本地 JoyAI 原始数据注册成可用 `--dataset {name}` 引用的**单个**数据集。
+
+    `dataset_path` 支持三种形态（都汇成一个数据集，preprocessor 逐行应用）：
+      - 单个文件:   '/path/a.jsonl'
+      - 通配符:     '/path/*.jsonl' 或 '/path/**/*.jsonl'（HF 递归 glob）
+      - 目录:       '/path/'  → 自动展开为 '/path/{pattern}'（默认递归所有 .jsonl）
+
+    在 `--custom_register_path your_reg.py` 里调用即可，例如::
+
+        from swift.dataset.preprocessor.streaming_video import register_joy_streaming_dataset
+        register_joy_streaming_dataset('/data/joyai/annotations')   # 目录下所有 jsonl
+    """
+    import glob as _glob
+    import os
+    from ..dataset_meta import DatasetMeta
+    from ..register import register_dataset
+    if os.path.isdir(dataset_path):
+        # fsspec 的 '*.jsonl' 只匹配顶层, '**/*.jsonl' 只匹配子目录, 无单一 .jsonl-glob
+        # 同时匹配两者。按实际布局选: 纯顶层(flat) -> *.jsonl; 有子目录(JoyAI 的
+        # task/source 结构) -> **/*.jsonl。混放时给出告警。
+        has_flat = bool(_glob.glob(os.path.join(dataset_path, '*.jsonl')))
+        has_nested = bool(_glob.glob(os.path.join(dataset_path, '*', '**', '*.jsonl'), recursive=True))
+        pat = '*.jsonl' if (has_flat and not has_nested) else pattern
+        if has_flat and has_nested:
+            logger.warning(f'{dataset_path} 顶层与子目录都有 jsonl; 用 {pat!r} 只会匹配子目录, '
+                           '顶层文件请单独注册或移入子目录')
+        dataset_path = os.path.join(dataset_path, pat)
+    register_dataset(
+        DatasetMeta(
+            dataset_path=dataset_path,
+            dataset_name=name,
+            preprocess_func=JoyStreamingVideoPreprocessor(max_duration=max_duration),
+            tags=['video', 'streaming'],
+        ),
+        exist_ok=True)

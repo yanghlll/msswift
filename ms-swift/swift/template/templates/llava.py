@@ -425,6 +425,7 @@ class LLavaOneVision2Template(Template):
     # 两个 pad 都受截断保护: video_pad 在 splice 前短暂存在于 token 序列中（V3）
     placeholder_tokens = ['<|image_pad|>', '<|video_pad|>']
     use_model = True
+    # 目前不支持pack
     support_padding_free = False
     # chat_template.jinja 为每个视频产出的占位块。codec 后端把整块重写为
     # <X.X seconds><|vision_start|><|image_pad|>*n<|vision_end|>\n 序列
@@ -562,9 +563,9 @@ class LLavaOneVision2Template(Template):
         finally:
             vp.fixed_num_frames, vp.max_frames, vp.target_fps = saved
  
-        video_grid_thw = video_outputs['video_grid_thw']           # [num_videos, 3]
-        frame_timestamps = video_outputs['frame_timestamps']
-        _expand = self._official('_expand_video_block_for_frames')
+        video_grid_thw = video_outputs['video_grid_thw']           # [num_videos, 3] video_grid_thw 形状 [num_videos, 3],每行是 (t, h, w)
+        frame_timestamps = video_outputs['frame_timestamps']       # frame_timestamps = 每帧在原视频里的秒数,如 [[0.0, 0.5, 1.0, 1.5, ...]]
+        _expand = self._official('_expand_video_block_for_frames') # 
  
         expanded_texts = []
         for video_idx in range(video_grid_thw.shape[0]):
@@ -774,5 +775,129 @@ register_template(
     QwenTemplateMeta(
         MLLMTemplateType.llava_onevision2,
         template_cls=LLavaOneVision2Template,
+        agent_template=None,
+    ))
+
+
+class LLavaOneVision2StreamingTemplate(LLavaOneVision2Template):
+    """Streaming-video-understanding 模板（JoyAI-VL-Interaction 风格）。
+
+    数据是 `JoyStreamingVideoPreprocessor` 产出的每秒交错 turns：user turn 含
+    `<sec.0 seconds>` + 一个 `<|video_pad|>` 哨兵，assistant turn 是 `</silence>` 或
+    `</response> ...`。本模板在 encode 时把**整段视频**用 frames-sample 后端解码一次、
+    按秒分桶，把每秒的帧视觉 token 替换进该秒的 `<|video_pad|>` 哨兵——从而在逐帧视觉块
+    之间保留每秒的 Q/A 结构。视觉块用裸 `<|vision_start|><|image_pad|>*n<|vision_end|>`
+    （不带 per-frame 时间戳，时间锚由 preprocessor 的 `<sec.0 seconds>` 提供），与 JoyAI 的
+    `<sec.0 seconds>\\n<image>` token 序列一致。
+
+    loss 权重由 `--loss_scale joy_streaming` 处理（`</silence>`/`</response>` 重加权）；
+    `</silence>,</response>` 需 `--new_special_tokens` 注册，`<|video_pad|>` 已在词表。
+    codec 后端留待后续（`VIDEO_BACKEND=codec` 目前抛 NotImplementedError）。
+    """
+
+    @staticmethod
+    def _add_default_tags(inputs: StdTemplateInputs) -> None:
+        # 单个视频由本模板经 <|video_pad|> 哨兵消费, 不走 <video> 标签。临时隐藏 videos,
+        # 避免 base._add_default_tags 在 messages[0] 前插入 <video> 标签(会多出一个 video_pad)。
+        videos = inputs.videos
+        inputs.videos = []
+        try:
+            Template._add_default_tags(inputs)
+        finally:
+            inputs.videos = videos
+
+    def _frames_by_second(self, inputs: StdTemplateInputs, fps: float, n_seconds: int,
+                          frames_per_sec: int):
+        """整段视频 frames-sample 解码 -> 每秒一个视觉文本桶 + (按保留帧切过的)张量。"""
+        if self.video_backend == 'codec':
+            raise NotImplementedError('streaming 模板暂只支持 frames 后端；请设 VIDEO_BACKEND=frames')
+        processor = self.processor
+        sms = int(processor.spatial_merge_size)
+        vp = processor.video_processor
+        saved = (vp.fixed_num_frames, vp.max_frames, vp.target_fps)
+        try:
+            vp.fixed_num_frames = None
+            vp.target_fps = float(fps)
+            vp.max_frames = int(n_seconds * frames_per_sec)
+            video_outputs = vp(videos=list(inputs.videos), return_tensors='pt')
+        finally:
+            vp.fixed_num_frames, vp.max_frames, vp.target_fps = saved
+
+        grid = video_outputs['video_grid_thw'][0]              # [T, H, W]
+        T, H, W = int(grid[0]), int(grid[1]), int(grid[2])
+        hw = H * W                                             # 每帧 patch 数(pre-merge)
+        n_per_frame = hw // (sms * sms)                        # 每帧 image_pad token 数
+        frame_seconds = list(video_outputs['frame_timestamps'][0])[:T]
+        pv = video_outputs['pixel_values_videos']              # [T*hw, C]
+        pp = video_outputs['patch_positions']                 # [T*hw, 3]
+
+        bare = '<|vision_start|>' + '<|image_pad|>' * n_per_frame + '<|vision_end|>'
+        buckets: List[List[str]] = [[] for _ in range(n_seconds)]
+        keep: List[int] = []
+        for i in range(T):
+            sec = int(frame_seconds[i])
+            if sec >= n_seconds:      # 截断超界: 丢弃该帧(不进桶、不保留张量行)
+                continue
+            buckets[sec].append(bare)
+            keep.append(i)
+        bucket_texts = ['\n'.join(b) for b in buckets]         # 空秒 -> ''
+
+        dtype = video_outputs['video_grid_thw'].dtype
+        if len(keep) == T:
+            pv_k, pp_k = pv, pp
+            grid_rows = torch.tensor([[1, H, W]] * T, dtype=dtype)
+        else:
+            row_idx = torch.tensor([j for i in keep for j in range(i * hw, (i + 1) * hw)],
+                                   dtype=torch.long)
+            pv_k, pp_k = pv[row_idx], pp[row_idx]
+            grid_rows = torch.tensor([[1, H, W]] * len(keep), dtype=dtype)
+        tensors = {'pixel_values': pv_k, 'image_grid_thw': grid_rows, 'patch_positions': pp_k}
+        return bucket_texts, tensors
+
+    def _encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
+        # 走祖父类 Template._encode(而非父类的单视频 video_pad 路径): 由 messages 产出
+        # role 结构化 input_ids/labels/loss_scale, 每秒 <|video_pad|> 为单 token 哨兵,
+        # </silence>/</response> 由 joy_streaming 监督。
+        encoded = Template._encode(self, inputs)
+        if not inputs.videos:            # 纯文本 / offline 样本 -> 退化标准 SFT
+            return encoded
+
+        ck = inputs.chat_template_kwargs or {}
+        n_seconds = int(ck['stream_n_seconds'])
+        fps = float(ck['stream_fps'])
+        frames_per_sec = int(ck.get('stream_frames_per_sec', max(int(fps), 1)))
+
+        input_ids = encoded['input_ids']
+        labels = encoded.get('labels')
+        loss_scale = encoded.get('loss_scale')
+
+        bucket_texts, tensors = self._frames_by_second(inputs, fps, n_seconds, frames_per_sec)
+
+        idx_list = findall(input_ids, self.video_token_id)
+        assert len(idx_list) == n_seconds == len(bucket_texts), (
+            f'<|video_pad|> 哨兵数 {len(idx_list)} != n_seconds {n_seconds} != 桶数 {len(bucket_texts)}')
+        tokenizer = self.processor.tokenizer
+        for i in range(len(idx_list) - 1, -1, -1):     # 倒序 splice 免下标位移
+            text = bucket_texts[i]
+            new_tokens = tokenizer(text, add_special_tokens=False)['input_ids'] if text else []
+            input_ids, labels, loss_scale = self._splice(
+                input_ids, labels, loss_scale, idx_list[i], idx_list[i] + 1, new_tokens)
+
+        assert self.video_token_id not in input_ids, 'video_pad 哨兵未全部替换'
+        n_image_pad = sum(1 for t in input_ids if t == self.image_token_id)
+        expect = int(tensors['image_grid_thw'].prod(dim=1).sum()) // (int(self.processor.spatial_merge_size)**2)
+        assert n_image_pad == expect, f'<|image_pad|> 数 {n_image_pad} != sum(t*h*w)/merge^2 {expect}'
+
+        encoded['input_ids'] = input_ids
+        encoded['labels'] = labels
+        encoded['loss_scale'] = loss_scale
+        encoded.update(tensors)
+        return encoded
+
+
+register_template(
+    QwenTemplateMeta(
+        MLLMTemplateType.llava_onevision2_streaming,
+        template_cls=LLavaOneVision2StreamingTemplate,
         agent_template=None,
     ))
