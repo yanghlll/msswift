@@ -10,7 +10,7 @@ ROOT_IMAGE_DIR=/data/TimeLens \
 swift sft \
     --model /data1/zlx/cache/huggingface/hub/model/llavaov2 \
     --model_type llava_onevision2 \
-    --dataset /data1/zlx/cache/huggingface/hub/video_data/test/chat_TimeLens-100K_000_1fps_abs.jsonl \
+    --dataset /data1/zlx/cache/huggingface/hub/annotations_en_raw_jsonl \
     --new_special_tokens '</silence>' '</response>' \
     --load_from_cache_file True \
     --tuner_type full \
