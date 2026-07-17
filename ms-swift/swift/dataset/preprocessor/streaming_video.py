@@ -113,6 +113,17 @@ class JoyStreamingVideoPreprocessor(RowPreprocessor):
                     return None
                 response_map[min(t, n_seconds - 1)] = r['content']
 
+        # 所有 response 都落在 max_duration 之外 -> 保留下来会退化成全 </silence>,
+        # 等于教模型"该说话时保持沉默"(静默的数据污染)。直接丢弃这条样本。
+        # 注: JoyAI convert_data.py 此处是 continue(保留), 我们刻意更严格 ——
+        # max_duration=320 时仅影响 1/180k 条; 但调小 max_duration 时(128->4.2%,
+        # 64->11.9%)这个保护就很关键。
+        if raw_responses and not response_map:
+            logger.warning_once(
+                f'所有 response 都超出 max_duration={self.max_duration}s, 丢弃该样本: {video_path}',
+                hash_id='joy_stream_all_resp_cut')
+            return None
+
         messages: List[Dict[str, str]] = []
         for sec in range(n_seconds):
             parts = []
