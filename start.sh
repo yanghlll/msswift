@@ -4,6 +4,10 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# 启用 BuildKit：Dockerfile 中的 --mount=type=cache 缓存语法需要它
+export DOCKER_BUILDKIT=1
+export COMPOSE_DOCKER_CLI_BUILD=1
+
 MSSWIFT_VERSION=v4.4.1   # 与 Dockerfile 中的依赖版本保持一致
 IMAGE=msswift:torch2.7.1-cu128
 NAME=msswift

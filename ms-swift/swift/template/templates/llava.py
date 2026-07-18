@@ -779,6 +779,42 @@ register_template(
     ))
 
 
+# ------------------------------------------------------------ streaming 计时器
+# STREAM_PROFILE=1 打开: 每累计 N 次打印一次各阶段的 平均耗时/样本数, 定位瓶颈。
+# decode = 解码(dataloader worker), encode = 整条 _encode(worker),
+# vision_fwd = 视觉塔前向(GPU 主进程)。三者分别来自不同进程, 前缀带 pid 区分。
+import os as _os
+import time as _time
+
+_STREAM_PROFILE = _os.environ.get('STREAM_PROFILE', '') not in ('', '0', 'false', 'False')
+_PROF_EVERY = int(_os.environ.get('STREAM_PROFILE_EVERY', '20'))
+# 每个进程测够这么多样本后自动停止计时, 恢复零开销 —— 这样可以放心把 STREAM_PROFILE=1
+# 一直挂着: 只有前 _PROF_MAX 步付出 vision_fwd 的 cuda.synchronize 代价, 之后长训练不受影响。
+_PROF_MAX = int(_os.environ.get('STREAM_PROFILE_MAX', '60'))
+_prof_stats = {}
+_prof_disabled = False
+
+
+def _prof_on() -> bool:
+    """计时是否仍生效: 总开关开 且 本进程还没测满 _PROF_MAX。"""
+    return _STREAM_PROFILE and not _prof_disabled
+
+
+def _prof_add(stage: str, sec: float) -> None:
+    global _prof_disabled
+    st = _prof_stats.setdefault(stage, [0, 0.0])
+    st[0] += 1
+    st[1] += sec
+    if st[0] % _PROF_EVERY == 0:
+        print(f'[STREAM_PROFILE pid={_os.getpid()}] {stage}: '
+              f'n={st[0]} 均值={st[1] / st[0] * 1000:.0f}ms 本段总={st[1]:.1f}s', flush=True)
+    if st[0] >= _PROF_MAX:      # 本进程测够了 -> 关掉全部计时(vision_fwd 不再 synchronize)
+        _prof_disabled = True
+        print(f'[STREAM_PROFILE pid={_os.getpid()}] {stage} 达到 {_PROF_MAX} 样本, '
+              f'本进程停止计时, 恢复零开销。各段均值: '
+              f'{ {k: round(v[1] / v[0] * 1000) for k, v in _prof_stats.items()} } ms', flush=True)
+
+
 class LLavaOneVision2StreamingTemplate(LLavaOneVision2Template):
     """Streaming-video-understanding 模板（JoyAI-VL-Interaction 风格）。
 
@@ -819,7 +855,11 @@ class LLavaOneVision2StreamingTemplate(LLavaOneVision2Template):
             vp.fixed_num_frames = None
             vp.target_fps = float(fps)
             vp.max_frames = int(n_seconds * frames_per_sec)
+            _prof = _prof_on()
+            _t0 = _time.perf_counter() if _prof else 0
             video_outputs = vp(videos=list(inputs.videos), return_tensors='pt')
+            if _prof:
+                _prof_add('decode', _time.perf_counter() - _t0)
         finally:
             vp.fixed_num_frames, vp.max_frames, vp.target_fps = saved
 
@@ -858,6 +898,8 @@ class LLavaOneVision2StreamingTemplate(LLavaOneVision2Template):
         # 走祖父类 Template._encode(而非父类的单视频 video_pad 路径): 由 messages 产出
         # role 结构化 input_ids/labels/loss_scale, 每秒 <|video_pad|> 为单 token 哨兵,
         # </silence>/</response> 由 joy_streaming 监督。
+        _prof_enc = _prof_on()
+        _t_enc = _time.perf_counter() if _prof_enc else 0
         encoded = Template._encode(self, inputs)
         if not inputs.videos:            # 纯文本 / offline 样本 -> 退化标准 SFT
             return encoded
@@ -892,7 +934,23 @@ class LLavaOneVision2StreamingTemplate(LLavaOneVision2Template):
         encoded['labels'] = labels
         encoded['loss_scale'] = loss_scale
         encoded.update(tensors)
+        if _prof_enc:
+            _prof_add('encode_total', _time.perf_counter() - _t_enc)
         return encoded
+
+    def _post_encode(self, model, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        # 视觉塔前向在 GPU 主进程跑; cuda.synchronize 保证计时准(CUDA 异步)。
+        # 测满 _PROF_MAX 后 _prof_on() 变 False -> 不再 synchronize, 恢复零开销。
+        if not _prof_on():
+            return super()._post_encode(model, inputs)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        _t0 = _time.perf_counter()
+        out = super()._post_encode(model, inputs)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        _prof_add('vision_fwd', _time.perf_counter() - _t0)
+        return out
 
 
 register_template(
