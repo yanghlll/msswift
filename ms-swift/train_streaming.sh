@@ -84,7 +84,7 @@ ${SWIFT_BIN} sft \
   --max_length "${MAX_LENGTH}" \
   --truncation_strategy delete \
   --num_train_epochs 1 \
-  --learning_rate 1e-5 \
+  --learning_rate 2e-5 \
   --warmup_ratio 0.03 \
   --lr_scheduler_type cosine \
   --save_steps 500 \

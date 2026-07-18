@@ -24,6 +24,7 @@ Metadata the template needs (fps / n_seconds / frames_per_sec) rides in
 ``chat_template_kwargs`` — the only non-media row field that survives
 ``RowPreprocessor.remove_useless_columns``.
 """
+import os
 import subprocess
 from typing import Any, Dict, List, Optional
 
@@ -60,9 +61,13 @@ def _parse_times(time_str) -> List[int]:
 class JoyStreamingVideoPreprocessor(RowPreprocessor):
 
     def __init__(self, *, max_duration: int = 320, tail_margin: Optional[int] = None,
-                 **kwargs) -> None:
+                 video_root: Optional[str] = None, **kwargs) -> None:
         super().__init__(**kwargs)
         self.max_duration = max_duration
+        # video_root: 数据里 video_path 是相对路径(如 JoyAI 的 'videos_pool/xxx.mp4')时的
+        # 根目录。preprocess 阶段就要 ffprobe, 所以必须在这里解析成绝对路径 —— 模板阶段的
+        # ROOT_IMAGE_DIR 解析发生得太晚, 救不了这里。未显式传时回退读 ROOT_IMAGE_DIR env。
+        self.video_root = video_root or os.environ.get('ROOT_IMAGE_DIR') or None
         # tail_margin: 末个事件之后只再保留这么多秒, 其余视频尾部直接不看。
         #   None = 不裁 (JoyAI convert_data.py 的原版行为, 默认)
         #   0    = 裁到末事件那一秒 (最省, 但每条样本都在 </response> 后立刻结束,
@@ -84,9 +89,15 @@ class JoyStreamingVideoPreprocessor(RowPreprocessor):
         video_path = row.get('video_path') or (row.get('videos') or [None])[0]
         if not video_path:
             return None
+        # 相对路径 -> 用 video_root 拼成绝对路径(ffprobe 和后续解码都要能找到文件)
+        if self.video_root and not os.path.isabs(video_path) and not video_path.startswith('http'):
+            video_path = os.path.join(self.video_root, video_path)
         duration = _ffprobe_duration(video_path)
         if duration <= 0:
-            logger.warning_once(f'ffprobe duration<=0, skipping: {video_path}', hash_id='joy_stream_dur')
+            logger.warning_once(
+                f'ffprobe duration<=0, skipping: {video_path}. '
+                f'若是相对路径找不到文件, 传 video_root=(或设 ROOT_IMAGE_DIR)指向视频根目录。',
+                hash_id='joy_stream_dur')
             return None
 
         fps = self._adaptive_fps(duration)
@@ -169,6 +180,7 @@ class JoyStreamingVideoPreprocessor(RowPreprocessor):
 
 def register_joy_streaming_dataset(dataset_path: str, *, name: str = 'joy_streaming_video',
                                    max_duration: int = 320, tail_margin: Optional[int] = None,
+                                   video_root: Optional[str] = None,
                                    pattern: str = '**/*.jsonl') -> None:
     """把本地 JoyAI 原始数据注册成可用 `--dataset {name}` 引用的**单个**数据集。
 
@@ -186,7 +198,6 @@ def register_joy_streaming_dataset(dataset_path: str, *, name: str = 'joy_stream
         register_joy_streaming_dataset('/data/joyai/annotations', max_duration=230, tail_margin=10)
     """
     import glob as _glob
-    import os
     from ..dataset_meta import DatasetMeta
     from ..register import register_dataset
     if os.path.isdir(dataset_path):
@@ -205,7 +216,7 @@ def register_joy_streaming_dataset(dataset_path: str, *, name: str = 'joy_stream
             dataset_path=dataset_path,
             dataset_name=name,
             preprocess_func=JoyStreamingVideoPreprocessor(
-                max_duration=max_duration, tail_margin=tail_margin),
+                max_duration=max_duration, tail_margin=tail_margin, video_root=video_root),
             tags=['video', 'streaming'],
         ),
         exist_ok=True)
