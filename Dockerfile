@@ -6,7 +6,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git curl wget vim tmux htop openssh-client \
         build-essential ninja-build ca-certificates \
+        ffmpeg \
     && rm -rf /var/lib/apt/lists/*
+# ffmpeg 提供 ffprobe: streaming 数据 preprocessor 用它拿视频时长
+# (否则每行时长=0 -> 数据集全空 -> ZeroDivisionError)
 
 RUN pip install --no-cache-dir -U pip setuptools wheel packaging ninja
 

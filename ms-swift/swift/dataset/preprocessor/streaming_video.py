@@ -39,16 +39,33 @@ STREAM_FRAME_TAG = '<|video_pad|>'
 
 
 def _ffprobe_duration(video_path: str) -> float:
-    """Video duration in seconds via ffprobe (0.0 on failure). Mirrors
-    convert_data.get_video_duration without the threaded cache."""
+    """视频时长(秒)。优先 ffprobe(镜像 convert_data.get_video_duration), 失败/没装
+    ffprobe 时回退 opencv(frames 后端本就依赖它) —— 避免硬依赖系统 ffprobe 二进制。
+    两者都拿不到返回 0.0。"""
     try:
         result = subprocess.run(
             ['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration',
              '-of', 'default=noprint_wrappers=1:nokey=1', video_path],
             capture_output=True, text=True)
-        return float(result.stdout.strip())
+        d = float(result.stdout.strip())
+        if d > 0:
+            return d
     except (ValueError, AttributeError, OSError):
-        return 0.0
+        pass
+    # 回退: opencv 用 帧数/fps 估时长
+    try:
+        import cv2
+        cap = cv2.VideoCapture(video_path)
+        try:
+            frames = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+            fps = cap.get(cv2.CAP_PROP_FPS) or 0
+        finally:
+            cap.release()
+        if frames > 0 and fps > 0:
+            return float(frames) / float(fps)
+    except Exception:
+        pass
+    return 0.0
 
 
 def _parse_times(time_str) -> List[int]:
