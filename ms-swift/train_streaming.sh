@@ -82,7 +82,7 @@ ${SWIFT_BIN} sft \
   --per_device_train_batch_size 1 \
   --gradient_accumulation_steps $((16 / NPROC)) \
   --max_length "${MAX_LENGTH}" \
-  --truncation_strategy raise \
+  --truncation_strategy delete \
   --num_train_epochs 1 \
   --learning_rate 1e-5 \
   --warmup_ratio 0.03 \
