@@ -59,9 +59,18 @@ def _parse_times(time_str) -> List[int]:
 
 class JoyStreamingVideoPreprocessor(RowPreprocessor):
 
-    def __init__(self, *, max_duration: int = 320, **kwargs) -> None:
+    def __init__(self, *, max_duration: int = 320, tail_margin: Optional[int] = None,
+                 **kwargs) -> None:
         super().__init__(**kwargs)
         self.max_duration = max_duration
+        # tail_margin: 末个事件之后只再保留这么多秒, 其余视频尾部直接不看。
+        #   None = 不裁 (JoyAI convert_data.py 的原版行为, 默认)
+        #   0    = 裁到末事件那一秒 (最省, 但每条样本都在 </response> 后立刻结束,
+        #          模型学不到"答完之后继续闭嘴", 不推荐)
+        #   10~30= 推荐: 保留一段尾部静默作为负样本, 同时砍掉无意义的长尾
+        # 动机: 末事件之后的秒全是 </silence>, 而 joy_streaming 的
+        # w_silence_repeated=0.4 本就在降权连续静默 —— 低价值却吃满算力。
+        self.tail_margin = tail_margin
 
     @staticmethod
     def _adaptive_fps(duration: float) -> float:
@@ -124,6 +133,15 @@ class JoyStreamingVideoPreprocessor(RowPreprocessor):
                 hash_id='joy_stream_all_resp_cut')
             return None
 
+        # 末事件之后的秒全是 </silence>, 没有信息量却按 30 token/秒 + 每秒的帧
+        # 吃满算力。裁到 max(存活事件) + tail_margin。
+        # 必须放在两个 map 建好之后(用存活的事件算), 且 n_seconds 只减不增、
+        # 又保证 >= max(events)+1, 所以不会把任何 map 的 key 甩到范围外。
+        if self.tail_margin is not None:
+            events = list(question_map) + list(response_map)
+            if events:
+                n_seconds = min(n_seconds, max(events) + self.tail_margin + 1)
+
         messages: List[Dict[str, str]] = []
         for sec in range(n_seconds):
             parts = []
@@ -150,7 +168,8 @@ class JoyStreamingVideoPreprocessor(RowPreprocessor):
 
 
 def register_joy_streaming_dataset(dataset_path: str, *, name: str = 'joy_streaming_video',
-                                   max_duration: int = 320, pattern: str = '**/*.jsonl') -> None:
+                                   max_duration: int = 320, tail_margin: Optional[int] = None,
+                                   pattern: str = '**/*.jsonl') -> None:
     """把本地 JoyAI 原始数据注册成可用 `--dataset {name}` 引用的**单个**数据集。
 
     `dataset_path` 支持三种形态（都汇成一个数据集，preprocessor 逐行应用）：
@@ -158,10 +177,13 @@ def register_joy_streaming_dataset(dataset_path: str, *, name: str = 'joy_stream
       - 通配符:     '/path/*.jsonl' 或 '/path/**/*.jsonl'（HF 递归 glob）
       - 目录:       '/path/'  → 自动展开为 '/path/{pattern}'（默认递归所有 .jsonl）
 
+    `max_duration` 时间轴上限(秒); `tail_margin` 末个事件之后只再保留几秒(None=不裁,
+    见 JoyStreamingVideoPreprocessor)。
+
     在 `--custom_register_path your_reg.py` 里调用即可，例如::
 
         from swift.dataset.preprocessor.streaming_video import register_joy_streaming_dataset
-        register_joy_streaming_dataset('/data/joyai/annotations')   # 目录下所有 jsonl
+        register_joy_streaming_dataset('/data/joyai/annotations', max_duration=230, tail_margin=10)
     """
     import glob as _glob
     import os
@@ -182,7 +204,8 @@ def register_joy_streaming_dataset(dataset_path: str, *, name: str = 'joy_stream
         DatasetMeta(
             dataset_path=dataset_path,
             dataset_name=name,
-            preprocess_func=JoyStreamingVideoPreprocessor(max_duration=max_duration),
+            preprocess_func=JoyStreamingVideoPreprocessor(
+                max_duration=max_duration, tail_margin=tail_margin),
             tags=['video', 'streaming'],
         ),
         exist_ok=True)
