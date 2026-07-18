@@ -80,7 +80,7 @@ ${SWIFT_BIN} sft \
   --load_from_cache_file True \
   --dataloader_num_workers 8 \
   --per_device_train_batch_size 1 \
-  --gradient_accumulation_steps $(expr 16 / $nproc_per_node) \
+  --gradient_accumulation_steps $((16 / NPROC)) \
   --max_length "${MAX_LENGTH}" \
   --truncation_strategy raise \
   --num_train_epochs 1 \
