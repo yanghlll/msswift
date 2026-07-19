@@ -779,12 +779,90 @@ register_template(
     ))
 
 
+# ---------------------------------------------- decord 三级回退(多线程失败救援)
+# 官方 video_processor 用 decord.VideoReader(path)(默认多线程)。某些畸形 h264 会让
+# 多线程解码器崩(threaded_decoder.cc), 官方随即跳到 OpenCV(比 decord 慢 ~2x)。
+# 本 patch 插入中间一档: 多线程 get_batch 崩 -> 单线程 decord 重开重试(仍比 OpenCV 快、
+# 且不崩), 只有单线程也崩才让它落到官方的 OpenCV 回退。好视频永远走多线程全速, 单线程
+# 只作用于失败的少数。env DECORD_ROBUST_RETRY=0 可关。
+import os as _os
+import time as _time
+
+
+def _install_robust_decord() -> None:
+    if _os.environ.get('DECORD_ROBUST_RETRY', '1') in ('0', 'false', 'False'):
+        return
+    try:
+        import decord
+    except ImportError:
+        return
+    Orig = decord.VideoReader
+    if getattr(Orig, '_robust_patched', False):
+        return
+
+    class _RobustVideoReader:
+        _robust_patched = True
+
+        def __init__(self, path, *args, **kwargs):
+            self._p = path
+            try:
+                self._vr = Orig(path, *args, **kwargs)      # 默认多线程, 快
+                self._single = False
+            except Exception:
+                self._vr = Orig(path, num_threads=1)        # 连开都失败 -> 单线程
+                self._single = True
+
+        def __getattr__(self, name):
+            if name in ('_vr', '_p', '_single'):
+                raise AttributeError(name)
+            return getattr(self._vr, name)                  # get_avg_fps 等透传
+
+        def __len__(self):
+            return len(self._vr)
+
+        def get_batch(self, indices):
+            try:
+                return self._vr.get_batch(indices)
+            except Exception:
+                if self._single:
+                    raise                                   # 单线程也崩 -> 交给官方 OpenCV 回退
+                self._vr = Orig(self._p, num_threads=1)     # 多线程解码崩 -> 单线程重试
+                self._single = True
+                return self._vr.get_batch(indices)
+
+    _RobustVideoReader._orig = Orig
+    decord.VideoReader = _RobustVideoReader
+
+
+def _quiet_video_logs() -> None:
+    """静音 ffmpeg/decord/opencv 解码畸形 h264 时刷屏的 `[h264 @ ..] mmco: unref short
+    failure` 等非致命警告。env STREAM_QUIET_DECODE=0 可关。真正的解码失败仍会通过
+    回退逻辑体现, 不受影响。"""
+    if _os.environ.get('STREAM_QUIET_DECODE', '1') in ('0', 'false', 'False'):
+        return
+    # opencv 的 ffmpeg 后端: 这两个 env 要在 cv2 首次 VideoCapture 前设(此处 import 时即设)
+    _os.environ.setdefault('OPENCV_FFMPEG_LOGLEVEL', '-8')   # AV_LOG_QUIET
+    _os.environ.setdefault('OPENCV_LOG_LEVEL', 'SILENT')
+    try:
+        import decord
+        decord.logging.set_level(decord.logging.QUIET)      # decord 内置 ffmpeg 的 av_log
+    except Exception:
+        pass
+    try:
+        import cv2
+        cv2.setLogLevel(0)                                  # 0 = SILENT
+    except Exception:
+        pass
+
+
+_install_robust_decord()
+_quiet_video_logs()
+
+
 # ------------------------------------------------------------ streaming 计时器
 # STREAM_PROFILE=1 打开: 每累计 N 次打印一次各阶段的 平均耗时/样本数, 定位瓶颈。
 # decode = 解码(dataloader worker), encode = 整条 _encode(worker),
 # vision_fwd = 视觉塔前向(GPU 主进程)。三者分别来自不同进程, 前缀带 pid 区分。
-import os as _os
-import time as _time
 
 _STREAM_PROFILE = _os.environ.get('STREAM_PROFILE', '') not in ('', '0', 'false', 'False')
 _PROF_EVERY = int(_os.environ.get('STREAM_PROFILE_EVERY', '20'))

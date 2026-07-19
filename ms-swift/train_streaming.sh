@@ -49,6 +49,8 @@ export W_SILENCE_FIRST=${W_SILENCE_FIRST:-1.0}
 export W_SILENCE_REPEATED=${W_SILENCE_REPEATED:-0.4}
 export W_RESPONSE=${W_RESPONSE:-1.5}
 export MAX_PIXELS=${MAX_PIXELS}
+export STREAM_PROFILE=1
+export STREAM_PROFILE_MAX=6
 
 # DEBUG: 少量步数快速验证能否跑通 + 看 step 时间/显存
 EXTRA=()
@@ -77,7 +79,7 @@ ${SWIFT_BIN} sft \
   --attn_impl flash_attn \
   --gradient_checkpointing true \
   --lazy_tokenize true \
-  --load_from_cache_file True \
+  --load_from_cache_file true \
   --dataloader_num_workers 8 \
   --per_device_train_batch_size 1 \
   --gradient_accumulation_steps $((16 / NPROC)) \
@@ -91,6 +93,7 @@ ${SWIFT_BIN} sft \
   --save_total_limit 3 \
   --logging_steps 5 \
   --dataset_num_proc 8 \
+  --use_liger_kernel true \
   --output_dir "${OUTPUT}" \
   "${EXTRA[@]}"
 

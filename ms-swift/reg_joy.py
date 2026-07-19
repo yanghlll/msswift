@@ -19,5 +19,5 @@ register_joy_streaming_dataset(
     name='joy_streaming_video',   # --dataset 用这个名字引用
     max_duration=230,             # 配 filter_joyai.py 砍掉的 1% 长尾 (t_max>230)
     tail_margin=10,               # 砍末事件之后的长尾 (留 10s 尾部静默做负样本)
-    video_root='/data1/zlx/cache/huggingface/hub/vl-interaction/videos_pool'
+    video_root='/data1/zlx/cache/huggingface/hub/vl-interaction'
 )
