@@ -73,6 +73,21 @@ export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:Tr
 #   桶 2e8 -> 4e8      —— 通信次数减半(约多占 ~1.5G 显存, 若紧改回 2e8)
 # 回官方: DS=zero2; 显存不够换 zero3: DS=${SWIFT_ROOT}/zero3_tuned.json(同样已调优)
 DS=${DS:-${SWIFT_ROOT}/zero2_tuned.json}
+# 自防御: 配置文件不存在(如没同步到训练机)或 DS 意外为空 -> 回退官方 zero2,
+# 绝不把空串/坏路径传给 --deepspeed(否则 swift 报 "Unable to parse json string: ''")
+if [[ -z "${DS}" ]]; then
+  echo "[train_streaming][WARN] DS 为空, 回退 zero2"; DS=zero2
+elif [[ "${DS}" == *.json && ! -f "${DS}" ]]; then
+  echo "[train_streaming][WARN] deepspeed 配置不存在: ${DS}, 回退官方 zero2"; DS=zero2
+fi
+# DS_PROFILE=1: 生成临时配置开 wall_clock_breakdown, DeepSpeed 每步打印 fwd/bwd/step
+# 各段耗时 —— 定位 20s/it 到底花在哪(配 DEBUG=1 跑 20 步看)。
+if [[ "${DS_PROFILE:-0}" == "1" && -f "${DS}" ]]; then
+  DS_TMP=$(mktemp /tmp/ds_profile_XXXX.json)
+  python -c "import json,sys; c=json.load(open('${DS}')); c['wall_clock_breakdown']=True; json.dump(c, open('${DS_TMP}','w'), indent=2)"
+  DS=${DS_TMP}
+fi
+echo "[train_streaming] deepspeed = ${DS}"
 
 # DEBUG: 少量步数快速验证能否跑通 + 看 step 时间/显存
 EXTRA=()
@@ -99,10 +114,11 @@ ${SWIFT_BIN} sft \
   --freeze_aligner false \
   --torch_dtype bfloat16 \
   --attn_impl flash_attn \
-  --gradient_checkpointing true \
+  --gradient_checkpointing "${GC:-true}" \
   --lazy_tokenize true \
   --load_from_cache_file true \
   --dataloader_num_workers 8 \
+  ${PF:+--padding_free true} \
   --per_device_train_batch_size "${BS:-1}" \
   --gradient_accumulation_steps "$(( 16 / NPROC / ${BS:-1} > 0 ? 16 / NPROC / ${BS:-1} : 1 ))" \
   --max_length "${MAX_LENGTH}" \

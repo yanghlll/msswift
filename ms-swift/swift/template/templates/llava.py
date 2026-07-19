@@ -1218,6 +1218,9 @@ class LLavaOneVision2StreamingTemplate(LLavaOneVision2Template):
         encoded.update(tensors)
         if _prof_enc:
             _prof_add('encode_total', _time.perf_counter() - _t_enc)
+            # 序列长度画像(判断 GPU 是否被喂饱/padding_free 收益): 打印值即 token 数
+            # (借用计时打印通道, "均值=NNNNms" 读作 NNNN tokens)
+            _prof_add('seq_len(tok)', len(input_ids) / 1000.0)
         return encoded
 
     def _post_encode(self, model, inputs: Dict[str, Any]) -> Dict[str, Any]:
