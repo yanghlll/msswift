@@ -51,6 +51,10 @@ export W_RESPONSE=${W_RESPONSE:-1.5}
 export MAX_PIXELS=${MAX_PIXELS}
 export STREAM_PROFILE=1
 export STREAM_PROFILE_MAX=6
+# 解码端降采样: 解码时就把帧缩到短边 N(而非 1080p 全解再 smart_resize), decode 段
+# 提速数倍。取值须 ≥ smart_resize 最终分辨率(MAX_PIXELS=100352 时 ~317px, 448 有余量)。
+# 0 = 关。日志看 [STREAM_PIXELS] 确认每帧 token 数不因此变化。
+export DECORD_SHORT_SIDE=${DECORD_SHORT_SIDE:-448}
 
 # DEBUG: 少量步数快速验证能否跑通 + 看 step 时间/显存
 EXTRA=()
@@ -85,6 +89,7 @@ ${SWIFT_BIN} sft \
   --gradient_accumulation_steps $((16 / NPROC)) \
   --max_length "${MAX_LENGTH}" \
   --truncation_strategy delete \
+  --use_logits_to_keep true \
   --num_train_epochs 1 \
   --learning_rate 2e-5 \
   --warmup_ratio 0.03 \
@@ -101,9 +106,15 @@ ${SWIFT_BIN} sft \
 
 # =============================================================================
 # 调参提示(按 8×H20 的"算力受限"特点):
-#   - 显存不是瓶颈, 算力是。想提速 -> 降 max_duration(reg_joy.py) 或 MAX_PIXELS。
+#   - 跑起来先看两行日志:
+#       [STREAM_PIXELS] 每帧 HxW -> N tokens/帧   ← 验证 MAX_PIXELS 真吃进 video_processor
+#       use_logits_to_keep: True                  ← 只算被监督位置的 logits(LOV2 forward 已确认支持)
+#   - use_logits_to_keep=true 是显存最大杠杆: loss_scale 路径会 materialize 完整 logits
+#     并 fp32 upcast(32768×~152k 词表 ≈ 10G bf16 + 20G fp32); 开掩码后只剩被监督的
+#     几百个位置, 省 50-100x。若 loss 异常再关掉排查。
+#   - 想提速 -> 降 max_duration(reg_joy.py) 或 MAX_PIXELS; DECORD_SHORT_SIDE 已开(解码提速)。
 #     token 数 ~线性决定 step 时间。先 DEBUG=1 测实际 s/step 再定。
-#   - OOM(不太可能): 降 MAX_PIXELS 或 max_length; ZeRO-2 已把优化器状态分片。
+#   - OOM: 顺序试 use_logits_to_keep(已开) -> 降 MAX_PIXELS -> 降 MAX_LENGTH -> zero3。
 #   - 全局 batch = NPROC × per_device_bs × grad_accum = 8×1×4 = 32。
 #   - 新 token(</silence></response>)是随机初始化的; 全参训练会自然学到它们的
 #     embedding。**若改用 LoRA, 必须加 --modules_to_save embed_tokens,lm_head**,
