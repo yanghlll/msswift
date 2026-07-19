@@ -919,6 +919,27 @@ def _prof_add(stage: str, sec: float) -> None:
               flush=True)
 
 
+# ------------------------------------------------------- MAX_PIXELS 可见性(视频帧)
+# 坑: streaming 的 _frames_by_second(以及非流式 _encode_video_frames)从不把 MAX_PIXELS
+# 传给 video_processor —— ip.max_pixels 只作用于**图像** processor, 视频帧一直用 checkpoint
+# 默认(≈4e6 px, ~5000 tok/帧), 所以 MAX_PIXELS 对视频"看似无效"、怎么调都 OOM。
+# 下面把 MAX_PIXELS 落到 vp 上, 并**一次性打印每帧实际 image token 数**, 让它到底生没生效
+# 从日志直接可见(n_per_frame ≈ MAX_PIXELS / (patch^2 * merge^2))。
+_pixel_budget_logged = False
+_pixel_budget_warned = False
+
+
+def _log_frame_budget(H: int, W: int, n_per_frame: int, max_pixels) -> None:
+    global _pixel_budget_logged
+    if _pixel_budget_logged:
+        return
+    _pixel_budget_logged = True
+    print(f'[STREAM_PIXELS pid={_os.getpid()}] 每帧 patch网格 {H}x{W} -> {n_per_frame} '
+          f'image tokens/帧 (MAX_PIXELS={max_pixels})。序列长度≈Σ帧 n_per_frame, '
+          f'logits/显存~线性于此; 若这里没随 MAX_PIXELS 变小, 说明预算没吃到 video_processor。',
+          flush=True)
+
+
 class LLavaOneVision2StreamingTemplate(LLavaOneVision2Template):
     """Streaming-video-understanding 模板（JoyAI-VL-Interaction 风格）。
 
@@ -946,6 +967,34 @@ class LLavaOneVision2StreamingTemplate(LLavaOneVision2Template):
         finally:
             inputs.videos = videos
 
+    def _apply_video_pixel_budget(self, vp):
+        """把 MAX_PIXELS(self.max_pixels)落到 video_processor 上, 返回 [(attr, old), ...] 供还原。
+        LOV2 的 vp 沿用 Qwen2-VL 视频处理器: max_pixels/min_pixels 控 smart_resize 像素预算。
+        防御式: 只动确实存在的属性; 一个都没命中就打印 vp 的像素相关属性名, 免得又静默失效。"""
+        if self.max_pixels is None:
+            return []
+        mp = int(self.max_pixels)
+        restore, hit = [], False
+        if hasattr(vp, 'max_pixels'):
+            restore.append(('max_pixels', vp.max_pixels)); vp.max_pixels = mp; hit = True
+        # min_pixels 不能超过 max_pixels, 否则 smart_resize 会把帧放大回去
+        mn = getattr(vp, 'min_pixels', None)
+        if isinstance(mn, (int, float)) and mn > mp:
+            restore.append(('min_pixels', vp.min_pixels)); vp.min_pixels = mp
+        size = getattr(vp, 'size', None)
+        if isinstance(size, dict) and 'longest_edge' in size:
+            restore.append(('size', dict(size)))
+            new_size = dict(size); new_size['longest_edge'] = mp; vp.size = new_size; hit = True
+        if not hit:
+            global _pixel_budget_warned
+            if not _pixel_budget_warned:
+                _pixel_budget_warned = True
+                px_attrs = [a for a in dir(vp) if 'pixel' in a.lower() or a in ('size', 'longest_edge')]
+                print(f'[STREAM_PIXELS pid={_os.getpid()}] 警告: MAX_PIXELS={mp} 没能作用于 '
+                      f'{type(vp).__name__}(未找到 max_pixels / size.longest_edge)。视频帧仍是默认分辨率。'
+                      f'该 processor 的像素相关属性: {px_attrs} —— 把正确的属性名告诉我再修。', flush=True)
+        return restore
+
     def _frames_by_second(self, inputs: StdTemplateInputs, fps: float, n_seconds: int,
                           frames_per_sec: int):
         """整段视频 frames-sample 解码 -> 每秒一个视觉文本桶 + (按保留帧切过的)张量。"""
@@ -955,6 +1004,7 @@ class LLavaOneVision2StreamingTemplate(LLavaOneVision2Template):
         sms = int(processor.spatial_merge_size)
         vp = processor.video_processor
         saved = (vp.fixed_num_frames, vp.max_frames, vp.target_fps)
+        px_restore = self._apply_video_pixel_budget(vp)        # MAX_PIXELS -> video_processor
         try:
             vp.fixed_num_frames = None
             vp.target_fps = float(fps)
@@ -966,11 +1016,14 @@ class LLavaOneVision2StreamingTemplate(LLavaOneVision2Template):
                 _prof_add('decode', _time.perf_counter() - _t0)
         finally:
             vp.fixed_num_frames, vp.max_frames, vp.target_fps = saved
+            for _k, _v in px_restore:                          # 还原像素预算属性
+                setattr(vp, _k, _v)
 
         grid = video_outputs['video_grid_thw'][0]              # [T, H, W]
         T, H, W = int(grid[0]), int(grid[1]), int(grid[2])
         hw = H * W                                             # 每帧 patch 数(pre-merge)
         n_per_frame = hw // (sms * sms)                        # 每帧 image_pad token 数
+        _log_frame_budget(H, W, n_per_frame, self.max_pixels)  # 一次性打印, 验证 MAX_PIXELS 生效
         frame_seconds = list(video_outputs['frame_timestamps'][0])[:T]
         pv = video_outputs['pixel_values_videos']              # [T*hw, C]
         pp = video_outputs['patch_positions']                 # [T*hw, 3]
