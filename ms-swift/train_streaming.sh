@@ -35,7 +35,7 @@ NPROC=${NPROC:-8}
 # token 预算(每帧 token = MAX_PIXELS/784; 见 README 公式)。
 # max_duration=230 + tail_margin=10 时平均 n_seconds ~60s, 但 worst case 仍可能
 # 撞 max_length -> 用 truncation_strategy=raise 让超长样本被跳过而非砍尾。
-MAX_PIXELS=${MAX_PIXELS:-100352}      # 128 tok/frame
+MAX_PIXELS=${MAX_PIXELS:-50176}      # 128 tok/frame
 MAX_LENGTH=${MAX_LENGTH:-32768}
 # -----------------------------------------------------------------------------
 
@@ -135,7 +135,7 @@ ${SWIFT_BIN} sft \
   --dataloader_num_workers 8 \
   ${PF:+--padding_free true} \
   --per_device_train_batch_size "${BS:-1}" \
-  --gradient_accumulation_steps "$(( 16 / NPROC / ${BS:-1} > 0 ? 16 / NPROC / ${BS:-1} : 1 ))" \
+  --gradient_accumulation_steps "$(( 64 / NPROC / ${BS:-1} > 0 ? 64 / NPROC / ${BS:-1} : 1 ))" \
   --max_length "${MAX_LENGTH}" \
   --truncation_strategy delete \
   --use_logits_to_keep true \
@@ -146,7 +146,7 @@ ${SWIFT_BIN} sft \
   --save_steps 500 \
   --save_total_limit 3 \
   --logging_steps 5 \
-  --dataset_num_proc 4 \
+  --dataset_num_proc 8 \
   --use_liger_kernel true \
   --output_dir "${OUTPUT}" \
   "${EXTRA[@]}"
