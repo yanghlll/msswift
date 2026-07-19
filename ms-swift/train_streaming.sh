@@ -54,6 +54,11 @@ export MAX_PIXELS=${MAX_PIXELS}
 # perf_counter, vision_fwd 的 cuda.synchronize 也只在前几步), 测满即零开销。
 export STREAM_PROFILE=${STREAM_PROFILE:-0}
 export STREAM_PROFILE_MAX=${STREAM_PROFILE_MAX:-6}
+# STAGE_PROFILE=1: GPU 侧分段计时(ViT/aligner-MLP/LLM 前反向 + fwd/bwd/gap 步级分解),
+# 前 STAGE_PROFILE_STEPS(默认8)步测完写 ${OUTPUT}/profile/stage_profile_rank*.log 后自动
+# 卸 hook。worker 侧(decord/encode)汇总也写同目录 worker.log。全链路瓶颈分析:
+#   STAGE_PROFILE=1 STREAM_PROFILE=1 DEBUG=1 bash train_streaming.sh
+export STAGE_PROFILE=${STAGE_PROFILE:-0}
 # 解码端降采样: 解码时就把帧缩到短边 N(而非 1080p 全解再 smart_resize), decode 段
 # 提速数倍。取值须 ≥ smart_resize 最终分辨率(MAX_PIXELS=100352 时 ~317px, 448 有余量)。
 # 0 = 关。日志看 [STREAM_PIXELS] 确认每帧 token 数不因此变化。
@@ -97,6 +102,10 @@ if [[ "${DEBUG:-0}" == "1" ]]; then
 fi
 
 mkdir -p "${OUTPUT}"
+if [[ "${STAGE_PROFILE}" == "1" || "${STREAM_PROFILE}" == "1" ]]; then
+  export STREAM_PROFILE_DIR=${STREAM_PROFILE_DIR:-${OUTPUT}/profile}
+  mkdir -p "${STREAM_PROFILE_DIR}"
+fi
 
 # swift 命令: 优先用 SWIFT_ROOT 里的入口
 SWIFT_BIN=${SWIFT_BIN:-swift}
@@ -157,6 +166,7 @@ ${SWIFT_BIN} sft \
 #     否则这两个控制 token 永远学不会(见 README)。
 #   - 断点续训: --resume_from_checkpoint ${OUTPUT}/checkpoint-xxx
 # =============================================================================
+
 
 
 

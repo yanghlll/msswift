@@ -2,6 +2,7 @@
 # Part of the implementation is borrowed from huggingface/transformers.
 import inspect
 import os
+import time
 import torch
 import torch.distributed as dist
 from contextlib import contextmanager, nullcontext
@@ -19,6 +20,17 @@ from swift.utils import HfConfigFactory, JsonlWriter, Serializer, gc_collect, ge
 from .arguments import Seq2SeqTrainingArguments
 from .mixin import DataLoaderMixin, SwiftMixin
 from .utils import per_token_loss_func, per_token_loss_func_sp
+
+# ---------------- 分段计时(STAGE_PROFILE=1): ViT/aligner-MLP/LLM 前反向 + 步级分解 ----
+# 前 STAGE_PROFILE_STEPS 步逐步计时并写 log(STREAM_PROFILE_DIR 或 output_dir 下
+# stage_profile_rank{r}.log), 测完自动卸 hook, 之后零开销。
+_STAGE_PROFILE = os.environ.get('STAGE_PROFILE', '') not in ('', '0', 'false', 'False')
+_STAGE_PROFILE_STEPS = int(os.environ.get('STAGE_PROFILE_STEPS', '8'))
+
+
+def _sp_sync():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
 
 logger = get_logger()
 
@@ -123,6 +135,10 @@ class Seq2SeqTrainer(SwiftMixin, DataLoaderMixin, HfSeq2SeqTrainer):
         return inputs
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        _sp = getattr(self, '_sp', None)
+        if _sp is not None and _sp['active']:
+            _sp_sync()
+            _sp_t0 = time.perf_counter()
         labels = None
         compute_loss_func: Callable = inputs.pop('compute_loss_func', None)
         loss_scale = inputs.pop('loss_scale', None)
@@ -235,8 +251,119 @@ class Seq2SeqTrainer(SwiftMixin, DataLoaderMixin, HfSeq2SeqTrainer):
             # Liger does not have logits
             # Unsloth has a bug with output logits
             self._compute_acc(outputs, labels, cu_seqlens=cu_seqlens)
+        if _sp is not None and _sp['active']:
+            _sp_sync()
+            _sp['cur']['fwd_total'] = _sp['cur'].get('fwd_total', 0.) + time.perf_counter() - _sp_t0
         return (loss, outputs) if return_outputs else loss
 
+    def _stage_profile_setup(self, model):
+        """定位 visual / visual.merger / language_model 三个子模块并挂前反向计时 hook。"""
+        st = {'active': True, 'cur': {}, 'rows': [], 'hooks': [], 'last_end': None, 'bwd_hook_ok': False}
+        self._sp = st
+        m = model
+        while hasattr(m, 'module'):
+            m = m.module
+        base = getattr(m, 'model', None)
+        mods = {}
+        if base is not None:
+            if getattr(base, 'visual', None) is not None:
+                mods['vision(ViT+MLP)'] = base.visual
+                if getattr(base.visual, 'merger', None) is not None:
+                    mods['aligner_mlp'] = base.visual.merger
+            if getattr(base, 'language_model', None) is not None:
+                mods['llm'] = base.language_model
+
+        def mk_fwd(name):
+            def pre(mod, args, kwargs=None):
+                _sp_sync()
+                st['cur'][name + '@t0'] = time.perf_counter()
+            def post(mod, args, output):
+                _sp_sync()
+                t0 = st['cur'].pop(name + '@t0', None)
+                if t0 is not None:
+                    st['cur'][name + '.fwd'] = st['cur'].get(name + '.fwd', 0.) + time.perf_counter() - t0
+            return pre, post
+
+        def mk_bwd(name):
+            def pre(mod, grad_output):
+                _sp_sync()
+                st['cur'][name + '@bt0'] = time.perf_counter()
+            def post(mod, grad_input, grad_output):
+                _sp_sync()
+                t0 = st['cur'].pop(name + '@bt0', None)
+                if t0 is not None:
+                    st['cur'][name + '.bwd'] = st['cur'].get(name + '.bwd', 0.) + time.perf_counter() - t0
+                    st['bwd_hook_ok'] = True
+            return pre, post
+
+        for name, sub in mods.items():
+            f_pre, f_post = mk_fwd(name)
+            st['hooks'] += [sub.register_forward_pre_hook(f_pre), sub.register_forward_hook(f_post)]
+            if name != 'vision(ViT+MLP)':      # ViT 冻结无反向; 只对 mlp/llm 试挂反向 hook
+                try:
+                    b_pre, b_post = mk_bwd(name)
+                    st['hooks'] += [sub.register_full_backward_pre_hook(b_pre),
+                                    sub.register_full_backward_hook(b_post)]
+                except Exception:
+                    pass
+        logger.info(f'[STAGE_PROFILE] 已挂 hook: {list(mods)}; 测前 {_STAGE_PROFILE_STEPS} 步后写 log 并卸载')
+
+    def _stage_profile_flush(self):
+        st = self._sp
+        st['active'] = False
+        for h in st['hooks']:
+            h.remove()
+        st['hooks'] = []
+        rows = st['rows']
+        keys = sorted({k for r in rows for k in r})
+        mean = {k: sum(r.get(k, 0.) for r in rows) / len(rows) for k in keys}
+        # 派生: 纯 ViT 前向 = vision 总前向 - aligner MLP 前向
+        if 'vision(ViT+MLP).fwd' in mean:
+            mean['vit_only.fwd'] = mean['vision(ViT+MLP).fwd'] - mean.get('aligner_mlp.fwd', 0.)
+        mean['other_fwd(embed/lm_head/loss等)'] = mean.get('fwd_total', 0.) \
+            - mean.get('vision(ViT+MLP).fwd', 0.) - mean.get('llm.fwd', 0.)
+        lines = [f'[STAGE_PROFILE rank={self.args.process_index}] {len(rows)} 步分段均值 (秒/步):']
+        for k in ('gap', 'fwd_total', 'vision(ViT+MLP).fwd', 'vit_only.fwd', 'aligner_mlp.fwd',
+                  'llm.fwd', 'other_fwd(embed/lm_head/loss等)', 'bwd_total', 'llm.bwd', 'aligner_mlp.bwd',
+                  'step_total'):
+            if k in mean:
+                lines.append(f'  {k:36s} {mean[k]:8.3f}s')
+        lines.append('  说明: gap=数据等待+优化器step+日志(在步间); ViT 冻结故无反向;')
+        lines.append('       bwd_total 含梯度检查点重算; ' + (
+            'llm.bwd 为 hook 实测。' if st['bwd_hook_ok'] else
+            '反向 hook 未生效(ModelOutput 非张量输出), llm.bwd≈bwd_total(MLP 反向极小)。'))
+        lines.append('  逐步明细:')
+        for i, r in enumerate(rows):
+            lines.append('    step%d: ' % i + ' '.join(f'{k}={v:.3f}' for k, v in sorted(r.items())))
+        text = '\n'.join(lines)
+        out_dir = os.environ.get('STREAM_PROFILE_DIR') or self.args.output_dir or '.'
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, f'stage_profile_rank{self.args.process_index}.log')
+        with open(path, 'w') as f:
+            f.write(text + '\n')
+        print(text, flush=True)
+        print(f'[STAGE_PROFILE rank={self.args.process_index}] 已写入 {path}, hook 已卸载, 恢复零开销', flush=True)
+
     def training_step(self, model, inputs, *args, **kwargs):
+        if _STAGE_PROFILE and not hasattr(self, '_sp'):
+            self._stage_profile_setup(model)
+        sp = getattr(self, '_sp', None)
+        if sp is None or not sp['active']:
+            with self.template.forward_context(self.model, inputs):
+                return super().training_step(model, inputs, *args, **kwargs)
+        _sp_sync()
+        t0 = time.perf_counter()
+        sp['cur']['gap'] = 0. if sp['last_end'] is None else t0 - sp['last_end']
         with self.template.forward_context(self.model, inputs):
-            return super().training_step(model, inputs, *args, **kwargs)
+            loss = super().training_step(model, inputs, *args, **kwargs)
+        _sp_sync()
+        t1 = time.perf_counter()
+        sp['last_end'] = t1
+        cur, sp['cur'] = sp['cur'], {}
+        cur = {k: v for k, v in cur.items() if not k.endswith('@t0') and not k.endswith('@bt0')}
+        cur['step_total'] = t1 - t0
+        cur['bwd_total'] = cur['step_total'] - cur.get('fwd_total', 0.)
+        sp['rows'].append(cur)
+        if len(sp['rows']) >= _STAGE_PROFILE_STEPS:
+            self._stage_profile_flush()
+        return loss

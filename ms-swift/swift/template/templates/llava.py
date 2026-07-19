@@ -801,6 +801,18 @@ class LLavaOneVision2Template(Template):
     def _call_visual(base_model, pixel_values, image_grid_thw, patch_positions):
         """V6 陷阱: 必须调内层 base_model.model 的 get_image_features
         （顶层同名方法丢弃 patch_positions）。内层签名已核对, 返回逐图 list。"""
+        if not getattr(base_model, '_vis_attn_logged', False):
+            base_model._vis_attn_logged = True
+            # 一次性自检: vision 子配置必须是 flash_attention_2, 否则视觉塔 attention 落进
+            # "逐窗口 split 的 Python 循环"慢路径(230帧/4帧窗×27层 ≈ 1500 次小 kernel)。
+            try:
+                vis = getattr(base_model.model.visual.config, '_attn_implementation', '?')
+                txt = getattr(base_model.model.language_model.config, '_attn_implementation', '?')
+                print(f'[VIS_ATTN] vision_tower={vis} llm={txt}'
+                      + (' <-- vision 未启用 flash_attention_2, 视觉塔在走慢路径!' if 'flash' not in str(vis) else ' (OK)'),
+                      flush=True)
+            except Exception:
+                pass
         image_embeds = base_model.model.get_image_features(
             pixel_values, image_grid_thw, patch_positions=patch_positions)
         return torch.cat(list(image_embeds), dim=0)
@@ -1030,9 +1042,17 @@ def _prof_add(stage: str, sec: float) -> None:
     n, tot = st[0], st[1]
     if n >= _PROF_MAX:                 # 只关掉**本 stage**, 其它 stage 继续测
         _prof_done.add(stage)
-        print(f'[STREAM_PROFILE pid={_os.getpid()}] {stage} 达到 {_PROF_MAX} 样本, '
-              f'本 stage 停止计时。均值={tot / n * 1000:.0f}ms (n={n}, 本段总={tot:.1f}s)',
-              flush=True)
+        line = (f'[STREAM_PROFILE pid={_os.getpid()}] {stage} 达到 {_PROF_MAX} 样本, '
+                f'本 stage 停止计时。均值={tot / n * 1000:.0f}ms (n={n}, 本段总={tot:.1f}s)')
+        print(line, flush=True)
+        prof_dir = _os.environ.get('STREAM_PROFILE_DIR')
+        if prof_dir:                   # 汇总行同时落盘, 与 GPU 侧 stage_profile 同目录
+            try:
+                _os.makedirs(prof_dir, exist_ok=True)
+                with open(_os.path.join(prof_dir, 'worker.log'), 'a') as _f:
+                    _f.write(line + '\n')
+            except Exception:
+                pass
     elif n == 1 or n % _PROF_EVERY == 0:   # 首样本立即出一条(便于马上看到 vision_fwd)
         print(f'[STREAM_PROFILE pid={_os.getpid()}] {stage}: '
               f'n={n} 均值={tot / n * 1000:.0f}ms 本次={sec * 1000:.0f}ms 本段总={tot:.1f}s',
