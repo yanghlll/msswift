@@ -789,6 +789,22 @@ import os as _os
 import time as _time
 
 
+# 每条问题视频只报一次(按路径去重), 避免同一坏文件每 epoch 刷屏; 去重后的这份列表
+# 正好就是"重编码仍没救活、需要再处理的视频"清单。DECORD_FALLBACK_LOG=0 可整体静音,
+# DECORD_FALLBACK_DEDUP=0 可关去重(想看每次命中的频率时用)。
+_decord_reported = set()
+
+
+def _report_fallback(path: str, msg: str) -> None:
+    if _os.environ.get('DECORD_FALLBACK_LOG', '1') in ('0', 'false', 'False'):
+        return
+    if _os.environ.get('DECORD_FALLBACK_DEDUP', '1') not in ('0', 'false', 'False'):
+        if path in _decord_reported:
+            return
+        _decord_reported.add(path)
+    print(f'[DECORD_FALLBACK pid={_os.getpid()}] {msg}: {path}', flush=True)
+
+
 def _install_robust_decord() -> None:
     if _os.environ.get('DECORD_ROBUST_RETRY', '1') in ('0', 'false', 'False'):
         return
@@ -808,7 +824,8 @@ def _install_robust_decord() -> None:
             try:
                 self._vr = Orig(path, *args, **kwargs)      # 默认多线程, 快
                 self._single = False
-            except Exception:
+            except Exception as e:
+                _report_fallback(path, f'多线程打开失败 -> 单线程重开 ({type(e).__name__})')
                 self._vr = Orig(path, num_threads=1)        # 连开都失败 -> 单线程
                 self._single = True
 
@@ -823,9 +840,11 @@ def _install_robust_decord() -> None:
         def get_batch(self, indices):
             try:
                 return self._vr.get_batch(indices)
-            except Exception:
-                if self._single:
-                    raise                                   # 单线程也崩 -> 交给官方 OpenCV 回退
+            except Exception as e:
+                if self._single:                            # 单线程也崩 -> 交给官方 OpenCV 回退
+                    _report_fallback(self._p, f'单线程 decord 也解码失败 -> 落 OpenCV ({type(e).__name__})')
+                    raise
+                _report_fallback(self._p, f'多线程解码崩 -> 单线程重试 ({type(e).__name__})')
                 self._vr = Orig(self._p, num_threads=1)     # 多线程解码崩 -> 单线程重试
                 self._single = True
                 return self._vr.get_batch(indices)
@@ -861,36 +880,43 @@ _quiet_video_logs()
 
 # ------------------------------------------------------------ streaming 计时器
 # STREAM_PROFILE=1 打开: 每累计 N 次打印一次各阶段的 平均耗时/样本数, 定位瓶颈。
-# decode = 解码(dataloader worker), encode = 整条 _encode(worker),
+# decode = 解码(dataloader worker), encode_total = 整条 _encode(worker),
 # vision_fwd = 视觉塔前向(GPU 主进程)。三者分别来自不同进程, 前缀带 pid 区分。
+#
+# 关键: 每个 stage 在**每个进程内**独立计数、独立到 _PROF_MAX 后独立停止。
+# 绝不用一个全局开关关掉所有 stage —— 否则 num_workers=0 时 decode 先到 MAX 会把
+# vision_fwd 一起关死(GPU 编码永远测不到)。_prof_done 记录本进程已测满的 stage。
 
 _STREAM_PROFILE = _os.environ.get('STREAM_PROFILE', '') not in ('', '0', 'false', 'False')
 _PROF_EVERY = int(_os.environ.get('STREAM_PROFILE_EVERY', '20'))
-# 每个进程测够这么多样本后自动停止计时, 恢复零开销 —— 这样可以放心把 STREAM_PROFILE=1
-# 一直挂着: 只有前 _PROF_MAX 步付出 vision_fwd 的 cuda.synchronize 代价, 之后长训练不受影响。
+# 每个 stage 在本进程测够这么多样本后自动停止计时, 恢复零开销 —— 这样可以放心把
+# STREAM_PROFILE=1 一直挂着: 只有前 _PROF_MAX 步付出 vision_fwd 的 cuda.synchronize
+# 代价, 之后长训练不受影响。
 _PROF_MAX = int(_os.environ.get('STREAM_PROFILE_MAX', '60'))
-_prof_stats = {}
-_prof_disabled = False
+_prof_stats = {}            # stage -> [count, total_sec]  (本进程内累计)
+_prof_done = set()          # 本进程内已测满 _PROF_MAX、停止计时的 stage
 
 
-def _prof_on() -> bool:
-    """计时是否仍生效: 总开关开 且 本进程还没测满 _PROF_MAX。"""
-    return _STREAM_PROFILE and not _prof_disabled
+def _prof_on(stage: str) -> bool:
+    """该 stage 在本进程是否仍需计时: 总开关开 且 本 stage 还没测满 _PROF_MAX。
+    每个 stage 独立判断, 一个 stage 停止不影响其它 stage。"""
+    return _STREAM_PROFILE and stage not in _prof_done
 
 
 def _prof_add(stage: str, sec: float) -> None:
-    global _prof_disabled
     st = _prof_stats.setdefault(stage, [0, 0.0])
     st[0] += 1
     st[1] += sec
-    if st[0] % _PROF_EVERY == 0:
-        print(f'[STREAM_PROFILE pid={_os.getpid()}] {stage}: '
-              f'n={st[0]} 均值={st[1] / st[0] * 1000:.0f}ms 本段总={st[1]:.1f}s', flush=True)
-    if st[0] >= _PROF_MAX:      # 本进程测够了 -> 关掉全部计时(vision_fwd 不再 synchronize)
-        _prof_disabled = True
+    n, tot = st[0], st[1]
+    if n >= _PROF_MAX:                 # 只关掉**本 stage**, 其它 stage 继续测
+        _prof_done.add(stage)
         print(f'[STREAM_PROFILE pid={_os.getpid()}] {stage} 达到 {_PROF_MAX} 样本, '
-              f'本进程停止计时, 恢复零开销。各段均值: '
-              f'{ {k: round(v[1] / v[0] * 1000) for k, v in _prof_stats.items()} } ms', flush=True)
+              f'本 stage 停止计时。均值={tot / n * 1000:.0f}ms (n={n}, 本段总={tot:.1f}s)',
+              flush=True)
+    elif n == 1 or n % _PROF_EVERY == 0:   # 首样本立即出一条(便于马上看到 vision_fwd)
+        print(f'[STREAM_PROFILE pid={_os.getpid()}] {stage}: '
+              f'n={n} 均值={tot / n * 1000:.0f}ms 本次={sec * 1000:.0f}ms 本段总={tot:.1f}s',
+              flush=True)
 
 
 class LLavaOneVision2StreamingTemplate(LLavaOneVision2Template):
@@ -933,7 +959,7 @@ class LLavaOneVision2StreamingTemplate(LLavaOneVision2Template):
             vp.fixed_num_frames = None
             vp.target_fps = float(fps)
             vp.max_frames = int(n_seconds * frames_per_sec)
-            _prof = _prof_on()
+            _prof = _prof_on('decode')
             _t0 = _time.perf_counter() if _prof else 0
             video_outputs = vp(videos=list(inputs.videos), return_tensors='pt')
             if _prof:
@@ -976,7 +1002,7 @@ class LLavaOneVision2StreamingTemplate(LLavaOneVision2Template):
         # 走祖父类 Template._encode(而非父类的单视频 video_pad 路径): 由 messages 产出
         # role 结构化 input_ids/labels/loss_scale, 每秒 <|video_pad|> 为单 token 哨兵,
         # </silence>/</response> 由 joy_streaming 监督。
-        _prof_enc = _prof_on()
+        _prof_enc = _prof_on('encode_total')
         _t_enc = _time.perf_counter() if _prof_enc else 0
         encoded = Template._encode(self, inputs)
         if not inputs.videos:            # 纯文本 / offline 样本 -> 退化标准 SFT
@@ -1018,8 +1044,9 @@ class LLavaOneVision2StreamingTemplate(LLavaOneVision2Template):
 
     def _post_encode(self, model, inputs: Dict[str, Any]) -> Dict[str, Any]:
         # 视觉塔前向在 GPU 主进程跑; cuda.synchronize 保证计时准(CUDA 异步)。
-        # 测满 _PROF_MAX 后 _prof_on() 变 False -> 不再 synchronize, 恢复零开销。
-        if not _prof_on():
+        # vision_fwd 独立计数: decode/encode_total 在 worker 里停止不影响这里, 即使
+        # num_workers=0(三者同进程)GPU 编码也能测满自己的 _PROF_MAX 后再停。
+        if not _prof_on('vision_fwd'):
             return super()._post_encode(model, inputs)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
