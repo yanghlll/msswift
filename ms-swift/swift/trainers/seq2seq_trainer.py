@@ -293,7 +293,8 @@ class Seq2SeqTrainer(SwiftMixin, DataLoaderMixin, HfSeq2SeqTrainer):
                 t0 = st['cur'].pop(name + '@bt0', None)
                 if t0 is not None:
                     st['cur'][name + '.bwd'] = st['cur'].get(name + '.bwd', 0.) + time.perf_counter() - t0
-                    st['bwd_hook_ok'] = True
+                    if name == 'llm':
+                        st['bwd_hook_ok'] = True
             return pre, post
 
         for name, sub in mods.items():

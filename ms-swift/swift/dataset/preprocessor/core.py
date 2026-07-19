@@ -34,6 +34,9 @@ class RowPreprocessor:
                                 'margin',
                                 'teacher_prompt',
                                 'chat_template_kwargs',
+                                # 预估 token 长度(int): group_by_length 分组用, 不参与 encode。
+                                # LazyLLMDataset['lengths'] 透传此列 -> BatchSamplerShard 分组。
+                                'lengths',
                                 # Qwen3-TTS
                                 'ref_audios',
                                 'audio_codes',

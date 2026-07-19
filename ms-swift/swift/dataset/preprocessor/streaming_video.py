@@ -183,9 +183,17 @@ class JoyStreamingVideoPreprocessor(RowPreprocessor):
             else:
                 messages.append({'role': 'assistant', 'content': '</silence>'})
 
+        # token 长度估算(零解码, 供 --group_by_length 消 straggler / _stat_dataset 统计):
+        # 视觉 = 每秒帧数 × (每帧 token + vision_start/end + 换行), 每帧 token ≈ MAX_PIXELS/784
+        # (patch14 × merge2 -> (28px)^2=784 px/token, 帧通常打满 smart_resize 预算);
+        # 文本按 ~3 字符/token 粗估。分组只需相对大小正确, n_seconds 主导, 精度足够。
+        n_per_frame = int(os.environ.get('MAX_PIXELS', '100352')) // 784
+        visual_est = n_seconds * frames_per_sec * (n_per_frame + 3)
+        text_est = sum(len(m['content']) for m in messages) // 3 + 5 * len(messages)
         return {
             'messages': messages,
             'videos': [video_path],
+            'lengths': int(visual_est + text_est + 32),
             'chat_template_kwargs': {
                 'stream_fps': fps,
                 'stream_n_seconds': n_seconds,

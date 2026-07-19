@@ -425,8 +425,15 @@ class LLavaOneVision2Template(Template):
     # 两个 pad 都受截断保护: video_pad 在 splice 前短暂存在于 token 序列中（V3）
     placeholder_tokens = ['<|image_pad|>', '<|video_pad|>']
     use_model = True
-    # 目前不支持pack
-    support_padding_free = False
+    # padding_free(PF=1 + BS>=2, batch 内 varlen 拼接)链路已审计开启:
+    #   - modeling 用 simple 1D position_ids 直通 Qwen3, tf5 FA2 由 position_ids 重启点
+    #     推导 cu_seqlens(无 mrope/get_rope_index 复杂度)
+    #   - packing_row 聚合 input_ids/labels/loss_scale/position_ids; length 在 _encode
+    #     (含视觉 splice)之后计算, position_ids 与最终序列对齐
+    #   - mm 张量(pixel_values/image_grid_thw/patch_positions)本就按行 concat, 与 batch 维无关
+    #   - padding_free 拼接后 batch 维=1, use_logits_to_keep 的布尔掩码路径继续生效
+    # 注: 数据集级 --packing 仍与 lazy_tokenize 冲突, 不可用; 这里只是 batch 内 padding_free。
+    support_padding_free = True
     # chat_template.jinja 为每个视频产出的占位块。codec 后端把整块重写为
     # <X.X seconds><|vision_start|><|image_pad|>*n<|vision_end|>\n 序列
     VIDEO_BLOCK = '<|vision_start|><|video_pad|><|vision_end|>'

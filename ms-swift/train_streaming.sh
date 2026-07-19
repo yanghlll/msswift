@@ -125,7 +125,8 @@ ${SWIFT_BIN} sft \
   --attn_impl flash_attn \
   --gradient_checkpointing "${GC:-true}" \
   --lazy_tokenize true \
-  --load_from_cache_file true \
+  --group_by_length "${GBL:-true}" \
+  --load_from_cache_file "${LOAD_CACHE:-true}" \
   --dataloader_num_workers 8 \
   ${PF:+--padding_free true} \
   --per_device_train_batch_size "${BS:-1}" \
@@ -157,6 +158,10 @@ ${SWIFT_BIN} sft \
 #     几百个位置, 省 50-100x。若 loss 异常再关掉排查。
 #   - 想提速 -> 降 max_duration(reg_joy.py) 或 MAX_PIXELS; DECORD_SHORT_SIDE 已开(解码提速)。
 #     token 数 ~线性决定 step 时间。先 DEBUG=1 测实际 s/step 再定。
+#   - group_by_length=true(GBL=false 关): 按预估长度分组, 同一步 8 卡拿到等长样本,
+#     消掉 bwd 里 ~5s 的 straggler 等待(bwd/fwd 应从 6.4x 回落到 ~3-4x)。
+#     首次启用或改过 MAX_PIXELS 后, 先 LOAD_CACHE=false 跑一次让数据集缓存重建出
+#     lengths 列(旧缓存没有该列会 KeyError), 之后恢复默认 true。
 #   - OOM: zero3 已是默认(zero2 实测 91.7G 顶满)。仍 OOM 顺序试: 降 MAX_LENGTH
 #     (32768->24576/16384, 激活/logits 线性降) -> 降 MAX_PIXELS -> reg_joy.py 降
 #     max_duration -> zero3 + offload_optimizer。
