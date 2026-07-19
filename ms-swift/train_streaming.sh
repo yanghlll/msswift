@@ -67,8 +67,12 @@ export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:Tr
 # DeepSpeed stage: 全参 8B + 32k 序列在 ZeRO-2 下每卡 参数16G+梯度bucket~16G+优化器分片12G
 # ≈44G, 加激活直接顶满 96G(实测 91.7G OOM 在 decoder MLP 前向)。ZeRO-3 把参数+梯度也
 # 分片(16+16G -> ~4G), 每卡省 ~28G。H20 有 NVLink, zero3 的 allgather 开销可接受。
-# 想回退: DS=zero2 bash train_streaming.sh
-DS=${DS:-zero2}
+# DeepSpeed 配置: 默认调优版 zero2(zero2_tuned.json)。与官方 zero2.json 的差别:
+#   overlap_comm=true  —— 梯度 reduce 与反向计算重叠(官方是 false, 反向每层算完都
+#                         干等通信, 是 GPU 功率只有 200W/500W 的主因)
+#   桶 2e8 -> 4e8      —— 通信次数减半(约多占 ~1.5G 显存, 若紧改回 2e8)
+# 回官方: DS=zero2; 显存不够换 zero3: DS=${SWIFT_ROOT}/zero3_tuned.json(同样已调优)
+DS=${DS:-${SWIFT_ROOT}/zero2_tuned.json}
 
 # DEBUG: 少量步数快速验证能否跑通 + 看 step 时间/显存
 EXTRA=()
@@ -99,8 +103,8 @@ ${SWIFT_BIN} sft \
   --lazy_tokenize true \
   --load_from_cache_file true \
   --dataloader_num_workers 8 \
-  --per_device_train_batch_size 1 \
-  --gradient_accumulation_steps $((16 / NPROC)) \
+  --per_device_train_batch_size "${BS:-1}" \
+  --gradient_accumulation_steps "$(( 16 / NPROC / ${BS:-1} > 0 ? 16 / NPROC / ${BS:-1} : 1 ))" \
   --max_length "${MAX_LENGTH}" \
   --truncation_strategy delete \
   --use_logits_to_keep true \
