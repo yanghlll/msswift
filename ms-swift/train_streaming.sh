@@ -41,6 +41,11 @@ MAX_LENGTH=${MAX_LENGTH:-32768}
 
 export PYTHONPATH=${SWIFT_ROOT}:${PYTHONPATH:-}
 export TOKENIZERS_PARALLELISM=false
+# 模型/tokenizer 全部从本地目录加载 -> 强制离线, 免去 transformers 每次去 huggingface.co
+# 做版本校验的联网等待(外网不通时每个 rank 干等数分钟, 即 "tokenizer 加载慢" 的元凶)。
+export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
+export TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1}
+export HF_HUB_ETAG_TIMEOUT=${HF_HUB_ETAG_TIMEOUT:-5}
 export NPROC_PER_NODE=${NPROC}
 
 # streaming 后端 + loss_scale 权重(joy_streaming 读这三个 env)
