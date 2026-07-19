@@ -49,12 +49,26 @@ export W_SILENCE_FIRST=${W_SILENCE_FIRST:-1.0}
 export W_SILENCE_REPEATED=${W_SILENCE_REPEATED:-0.4}
 export W_RESPONSE=${W_RESPONSE:-1.5}
 export MAX_PIXELS=${MAX_PIXELS}
-export STREAM_PROFILE=1
-export STREAM_PROFILE_MAX=6
+# 计时开关: 默认关(0)。要看各段耗时: STREAM_PROFILE=1 bash train_streaming.sh
+# 开销本身极小且自限(每进程只测前 STREAM_PROFILE_MAX 个样本, decode/encode 只是
+# perf_counter, vision_fwd 的 cuda.synchronize 也只在前几步), 测满即零开销。
+export STREAM_PROFILE=${STREAM_PROFILE:-0}
+export STREAM_PROFILE_MAX=${STREAM_PROFILE_MAX:-6}
 # 解码端降采样: 解码时就把帧缩到短边 N(而非 1080p 全解再 smart_resize), decode 段
 # 提速数倍。取值须 ≥ smart_resize 最终分辨率(MAX_PIXELS=100352 时 ~317px, 448 有余量)。
 # 0 = 关。日志看 [STREAM_PIXELS] 确认每帧 token 数不因此变化。
 export DECORD_SHORT_SIDE=${DECORD_SHORT_SIDE:-448}
+# 每个 VideoReader 解码线程上限: 64 个 worker 同时解码, auto 线程会过订阅抢 CPU。
+# 0 = 不干预。
+export DECORD_NUM_THREADS=${DECORD_NUM_THREADS:-2}
+# 显存碎片整理: reserved-but-unallocated 不再浪费(torch 官方建议)
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+
+# DeepSpeed stage: 全参 8B + 32k 序列在 ZeRO-2 下每卡 参数16G+梯度bucket~16G+优化器分片12G
+# ≈44G, 加激活直接顶满 96G(实测 91.7G OOM 在 decoder MLP 前向)。ZeRO-3 把参数+梯度也
+# 分片(16+16G -> ~4G), 每卡省 ~28G。H20 有 NVLink, zero3 的 allgather 开销可接受。
+# 想回退: DS=zero2 bash train_streaming.sh
+DS=${DS:-zero2}
 
 # DEBUG: 少量步数快速验证能否跑通 + 看 step 时间/显存
 EXTRA=()
@@ -76,7 +90,7 @@ ${SWIFT_BIN} sft \
   --loss_scale joy_streaming \
   --new_special_tokens '</silence>,</response>' \
   --tuner_type full \
-  --deepspeed zero2 \
+  --deepspeed "${DS}" \
   --freeze_vit true \
   --freeze_aligner false \
   --torch_dtype bfloat16 \
@@ -97,7 +111,7 @@ ${SWIFT_BIN} sft \
   --save_steps 500 \
   --save_total_limit 3 \
   --logging_steps 5 \
-  --dataset_num_proc 8 \
+  --dataset_num_proc 4 \
   --use_liger_kernel true \
   --output_dir "${OUTPUT}" \
   "${EXTRA[@]}"
@@ -114,7 +128,9 @@ ${SWIFT_BIN} sft \
 #     几百个位置, 省 50-100x。若 loss 异常再关掉排查。
 #   - 想提速 -> 降 max_duration(reg_joy.py) 或 MAX_PIXELS; DECORD_SHORT_SIDE 已开(解码提速)。
 #     token 数 ~线性决定 step 时间。先 DEBUG=1 测实际 s/step 再定。
-#   - OOM: 顺序试 use_logits_to_keep(已开) -> 降 MAX_PIXELS -> 降 MAX_LENGTH -> zero3。
+#   - OOM: zero3 已是默认(zero2 实测 91.7G 顶满)。仍 OOM 顺序试: 降 MAX_LENGTH
+#     (32768->24576/16384, 激活/logits 线性降) -> 降 MAX_PIXELS -> reg_joy.py 降
+#     max_duration -> zero3 + offload_optimizer。
 #   - 全局 batch = NPROC × per_device_bs × grad_accum = 8×1×4 = 32。
 #   - 新 token(</silence></response>)是随机初始化的; 全参训练会自然学到它们的
 #     embedding。**若改用 LoRA, 必须加 --modules_to_save embed_tokens,lm_head**,

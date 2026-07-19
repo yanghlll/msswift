@@ -135,8 +135,17 @@ class Seq2SeqTrainer(SwiftMixin, DataLoaderMixin, HfSeq2SeqTrainer):
                 or self.args.enable_dft_loss or self.args.enable_channel_loss
                 or self.template.sequence_parallel_size > 1) and 'labels' in inputs:
             if self.args.use_liger_kernel:
-                logger.warning_once('The cross_entropy loss function defined in Liger Kernel will not '
-                                    'take effect, potentially leading to increased GPU memory consumption.')
+                # per-token loss_scale 需要逐 token 的 loss, 与 Liger fused-linear-CE(只出标量
+                # loss、不落 logits)原理冲突, CE 必走非融合路径; 其余 Liger kernel 仍生效。
+                # 开了 use_logits_to_keep 时 lm_head 只对被监督位置算 logits, 显存影响可忽略,
+                # 不必再吓人; 没开时才警告(此时会 materialize 全长 logits, 显存确实会涨)。
+                if self.args.use_logits_to_keep:
+                    logger.info_once('Liger CE 不生效(loss_scale 需逐 token loss), 但 use_logits_to_keep '
+                                     '已开, logits 仅算被监督位置, 显存影响可忽略; 其余 Liger kernel 正常。')
+                else:
+                    logger.warning_once('The cross_entropy loss function defined in Liger Kernel will not '
+                                        'take effect, potentially leading to increased GPU memory consumption. '
+                                        '建议加 --use_logits_to_keep true 以只对被监督位置 materialize logits。')
             labels = inputs.pop('labels')
         outputs = self.template.compute_sft_loss(model, inputs, num_items_in_batch=num_items_in_batch, trainer=self)
         mode = 'train' if self.model.training else 'eval'

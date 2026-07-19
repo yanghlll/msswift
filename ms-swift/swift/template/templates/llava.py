@@ -857,6 +857,10 @@ def _install_robust_decord() -> None:
     # 分辨率(MAX_PIXELS=100352 时约 317x317, 短边 448 留了余量), 否则损失精度。
     # 默认 0 = 关(保持原行为)。原始短边本就 ≤ 目标时不缩。
     _short_side = int(_os.environ.get('DECORD_SHORT_SIDE', '0'))
+    # DECORD_NUM_THREADS=N 限制每个 VideoReader 的解码线程数。8 卡 × 8 worker = 64 个
+    # reader 同时活跃, decord 默认 auto 线程会开出数百线程抢 CPU(过订阅反而更慢)。
+    # 0 = 不干预(decord 默认)。
+    _num_threads = int(_os.environ.get('DECORD_NUM_THREADS', '0'))
 
     def _decode_wh(path):
         """按 DECORD_SHORT_SIDE 算解码目标 (width, height); 不适用时返回 None。
@@ -865,12 +869,15 @@ def _install_robust_decord() -> None:
             return None
         try:
             import cv2
+            _t = _time.perf_counter() if _prof_on('vr_probe') else 0
             cap = cv2.VideoCapture(path)
             try:
                 w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                 h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             finally:
                 cap.release()
+            if _t:
+                _prof_add('vr_probe', _time.perf_counter() - _t)
             if w <= 0 or h <= 0 or min(w, h) <= _short_side:
                 return None                                 # 拿不到 / 本来就不大 -> 不缩
             scale = _short_side / min(w, h)
@@ -886,22 +893,44 @@ def _install_robust_decord() -> None:
         def __init__(self, path, *args, **kwargs):
             self._p = path
             # 官方没显式传 width/height 时才注入解码降采样(不覆盖显式参数)
+            self._wh_injected = False
             if 'width' not in kwargs and 'height' not in kwargs and not args:
                 wh = _decode_wh(path) if isinstance(path, str) else None
                 if wh is not None:
                     kwargs = dict(kwargs, width=wh[0], height=wh[1])
+                    self._wh_injected = True
+            if _num_threads > 0 and 'num_threads' not in kwargs:
+                kwargs = dict(kwargs, num_threads=_num_threads)
             self._kw = kwargs
             try:
-                self._vr = Orig(path, *args, **kwargs)      # 默认多线程, 快
-                self._single = False
+                _t = _time.perf_counter() if _prof_on('vr_open') else 0
+                self._vr = Orig(path, *args, **kwargs)
+                if _t:
+                    _prof_add('vr_open', _time.perf_counter() - _t)
+                self._single = kwargs.get('num_threads') == 1
+                return
             except Exception as e:
-                _report_fallback(path, f'多线程打开失败 -> 单线程重开 ({type(e).__name__})')
-                self._vr = Orig(path, num_threads=1, **{k: v for k, v in kwargs.items()
-                                                        if k in ('width', 'height')})
-                self._single = True
+                err = e
+            if self._wh_injected:
+                # 注入的降采样参数本身可能就是打不开的原因: 先退回原分辨率重试,
+                # 绝不能让 width/height 一路跟进单线程/OpenCV 把好视频拖成 90s
+                kwargs = {k: v for k, v in kwargs.items() if k not in ('width', 'height')}
+                self._kw = kwargs
+                self._wh_injected = False
+                _report_fallback(path, f'降采样打开失败 -> 原分辨率重试 ({type(err).__name__})')
+                try:
+                    self._vr = Orig(path, *args, **kwargs)
+                    self._single = kwargs.get('num_threads') == 1
+                    return
+                except Exception as e2:
+                    err = e2
+            _report_fallback(path, f'多线程打开失败 -> 单线程重开 ({type(err).__name__})')
+            self._vr = Orig(path, num_threads=1, **{k: v for k, v in kwargs.items()
+                                                    if k in ('width', 'height')})
+            self._single = True
 
         def __getattr__(self, name):
-            if name in ('_vr', '_p', '_single', '_kw'):
+            if name in ('_vr', '_p', '_single', '_kw', '_wh_injected'):
                 raise AttributeError(name)
             return getattr(self._vr, name)                  # get_avg_fps 等透传
 
@@ -910,16 +939,35 @@ def _install_robust_decord() -> None:
 
         def get_batch(self, indices):
             try:
-                return self._vr.get_batch(indices)
+                _t = _time.perf_counter() if _prof_on('vr_get_batch') else 0
+                out = self._vr.get_batch(indices)
+                if _t:
+                    _prof_add('vr_get_batch', _time.perf_counter() - _t)
+                return out
             except Exception as e:
-                if self._single:                            # 单线程也崩 -> 交给官方 OpenCV 回退
-                    _report_fallback(self._p, f'单线程 decord 也解码失败 -> 落 OpenCV ({type(e).__name__})')
-                    raise
-                _report_fallback(self._p, f'多线程解码崩 -> 单线程重试 ({type(e).__name__})')
-                self._vr = Orig(self._p, num_threads=1,     # 多线程解码崩 -> 单线程重试(保持同分辨率)
-                                **{k: v for k, v in self._kw.items() if k in ('width', 'height')})
-                self._single = True
-                return self._vr.get_batch(indices)
+                err = e
+                if not self._single:
+                    _report_fallback(self._p, f'多线程解码崩 -> 单线程重试 ({type(err).__name__})')
+                    self._vr = Orig(self._p, num_threads=1,
+                                    **{k: v for k, v in self._kw.items() if k in ('width', 'height')})
+                    self._single = True
+                    try:
+                        return self._vr.get_batch(indices)
+                    except Exception as e2:
+                        err = e2
+                if self._wh_injected:
+                    # 最后一档 decord 自救: 去掉注入的降采样参数, 原分辨率单线程再试
+                    self._wh_injected = False
+                    self._kw = {k: v for k, v in self._kw.items() if k not in ('width', 'height')}
+                    _report_fallback(self._p, f'降采样解码失败 -> 原分辨率单线程重试 ({type(err).__name__})')
+                    self._vr = Orig(self._p, num_threads=1)
+                    try:
+                        return self._vr.get_batch(indices)
+                    except Exception as e3:
+                        _report_fallback(self._p, f'单线程 decord 也解码失败 -> 落 OpenCV ({type(e3).__name__})')
+                        raise
+                _report_fallback(self._p, f'单线程 decord 也解码失败 -> 落 OpenCV ({type(err).__name__})')
+                raise
 
     _RobustVideoReader._orig = Orig
     decord.VideoReader = _RobustVideoReader
