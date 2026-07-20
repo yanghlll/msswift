@@ -40,5 +40,16 @@ if [[ "${NNODES}" -gt 1 && "${MASTER_ADDR}" == "127.0.0.1" ]]; then
        "请设成节点0的真实IP。" >&2
 fi
 
-# 复用主脚本的全部配置与逻辑(DS/profile/env/swift 命令都在里面)
-exec bash train_streaming.sh "$@"
+# 日志: 每节点各写一份(名字带 NODE_RANK, 共享盘也不冲突)。tee = tmux 里实时看 + 存文件。
+LOG_DIR=${LOG_DIR:-$(pwd)/logs}
+mkdir -p "${LOG_DIR}"
+LOG=${LOG:-${LOG_DIR}/train_16gpu_rank${NODE_RANK}_$(date +%Y%m%d_%H%M%S).log}
+echo "[16gpu] 日志写入: ${LOG}  (另开一个 pane: tail -f ${LOG})"
+
+# 复用主脚本的全部配置与逻辑(DS/profile/env/swift 命令都在里面)。
+# set +e + PIPESTATUS: 让脚本退出码反映训练本身(而非 tee), 训练失败能正确报错。
+set +e
+bash train_streaming.sh "$@" 2>&1 | tee "${LOG}"
+rc=${PIPESTATUS[0]}
+echo "[16gpu] 训练退出码=${rc}  完整日志: ${LOG}"
+exit "${rc}"
