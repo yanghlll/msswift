@@ -18,7 +18,7 @@ set -euo pipefail
 
 # --------------------------- 改这里 ------------------------------------------
 # ms-swift 源码根(我们改过的那份): 让 `swift` 命令走这份代码
-SWIFT_ROOT=${SWIFT_ROOT:-/home/yifan.lu/msswift/ms-swift}
+SWIFT_ROOT=${SWIFT_ROOT:-/root/zlx_workspace/test/msswift-docker/ms-swift}
 # 模型: 本地目录 或 HF repo id
 MODEL=${MODEL:-/data1/zlx/cache/huggingface/hub/model/llavaov2}
 # 数据注册脚本(改它里面的 DATA_PATH)
@@ -82,7 +82,7 @@ export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:Tr
 #                         干等通信, 是 GPU 功率只有 200W/500W 的主因)
 #   桶 2e8 -> 4e8      —— 通信次数减半(约多占 ~1.5G 显存, 若紧改回 2e8)
 # 回官方: DS=zero2; 显存不够换 zero3: DS=${SWIFT_ROOT}/zero3_tuned.json(同样已调优)
-DS=${DS:-${SWIFT_ROOT}/zero2_tuned.json}
+DS=${DS:-zero2}
 # 自防御: 配置文件不存在(如没同步到训练机)或 DS 意外为空 -> 回退官方 zero2,
 # 绝不把空串/坏路径传给 --deepspeed(否则 swift 报 "Unable to parse json string: ''")
 if [[ -z "${DS}" ]]; then
@@ -135,7 +135,7 @@ ${SWIFT_BIN} sft \
   --dataloader_num_workers 8 \
   ${PF:+--padding_free true} \
   --per_device_train_batch_size "${BS:-1}" \
-  --gradient_accumulation_steps "$(( 64 / NPROC / ${BS:-1} > 0 ? 64 / NPROC / ${BS:-1} : 1 ))" \
+  --gradient_accumulation_steps "${GA:-$(( 64 / NPROC / ${BS:-1} > 0 ? 64 / NPROC / ${BS:-1} : 1 ))}" \
   --max_length "${MAX_LENGTH}" \
   --truncation_strategy delete \
   --use_logits_to_keep true \

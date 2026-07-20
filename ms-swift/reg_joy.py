@@ -12,7 +12,7 @@ from swift.dataset.preprocessor.streaming_video import register_joy_streaming_da
 # --- 改这一行为你的实际路径 ---
 # 目录(自动递归所有 jsonl): '/data/joyai/annotations_filtered'
 # 或通配: '/data/joyai/**/*.jsonl'   或单文件: '/data/joyai/chat/ActivityNet.jsonl'
-DATA_PATH = '/data1/zlx/cache/huggingface/hub/annotations_en_raw_jsonl_short'
+DATA_PATH = '/data1/zlx/cache/huggingface/hub/annotations_filtered_96'
 
 register_joy_streaming_dataset(
     DATA_PATH,
