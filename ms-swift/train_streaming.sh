@@ -121,7 +121,8 @@ ${SWIFT_BIN} sft \
   --dataset joy_streaming_video \
   --template llava_onevision2_streaming \
   --loss_scale joy_streaming \
-  --new_special_tokens '</silence>,</response>' \
+  --new_special_tokens '</silence>' '</response>' \
+  --modules_to_save embed_tokens lm_head \
   --tuner_type full \
   --deepspeed "${DS}" \
   --freeze_vit true \
@@ -143,7 +144,7 @@ ${SWIFT_BIN} sft \
   --learning_rate 2e-5 \
   --warmup_ratio 0.03 \
   --lr_scheduler_type cosine \
-  --save_steps 500 \
+  --save_steps 300 \
   --save_total_limit 3 \
   --logging_steps 5 \
   --dataset_num_proc 8 \

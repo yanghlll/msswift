@@ -24,9 +24,11 @@ Metadata the template needs (fps / n_seconds / frames_per_sec) rides in
 ``chat_template_kwargs`` — the only non-media row field that survives
 ``RowPreprocessor.remove_useless_columns``.
 """
+import hashlib
 import os
+import random
 import subprocess
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from swift.utils import get_logger
 from .core import RowPreprocessor
@@ -77,7 +79,9 @@ def _parse_times(time_str) -> List[int]:
 
 class JoyStreamingVideoPreprocessor(RowPreprocessor):
 
-    def __init__(self, *, max_duration: int = 320, tail_margin: Optional[int] = None,
+    def __init__(self, *, max_duration: int = 320,
+                 head_margin: Union[int, Tuple[int, int], None] = (5, 15),
+                 tail_margin: Union[int, Tuple[int, int], None] = (0, 10),
                  video_root: Optional[str] = None, **kwargs) -> None:
         super().__init__(**kwargs)
         self.max_duration = max_duration
@@ -85,13 +89,18 @@ class JoyStreamingVideoPreprocessor(RowPreprocessor):
         # 根目录。preprocess 阶段就要 ffprobe, 所以必须在这里解析成绝对路径 —— 模板阶段的
         # ROOT_IMAGE_DIR 解析发生得太晚, 救不了这里。未显式传时回退读 ROOT_IMAGE_DIR env。
         self.video_root = video_root or os.environ.get('ROOT_IMAGE_DIR') or None
-        # tail_margin: 末个事件之后只再保留这么多秒, 其余视频尾部直接不看。
-        #   None = 不裁 (JoyAI convert_data.py 的原版行为, 默认)
-        #   0    = 裁到末事件那一秒 (最省, 但每条样本都在 </response> 后立刻结束,
-        #          模型学不到"答完之后继续闭嘴", 不推荐)
-        #   10~30= 推荐: 保留一段尾部静默作为负样本, 同时砍掉无意义的长尾
-        # 动机: 末事件之后的秒全是 </silence>, 而 joy_streaming 的
-        # w_silence_repeated=0.4 本就在降权连续静默 —— 低价值却吃满算力。
+        # ---- 事件窗口截断: 只保留 [首事件-head, 末事件+tail] 这段, 时间轴归零从 0 秒开始 ----
+        # 动机: 问题/首事件【之前】的长 lead-in 全是 </silence>(数据 90% 是 silence,
+        # 元凶就是这段无问题的空转), 且答完之后的长尾也全 silence。两头一裁, 既大幅缓解
+        # silence:response 不平衡, 又缩短序列(省算力), 还把时间轴对齐到推理的 <0.0 seconds>。
+        #
+        # head_margin: 首事件【之前】保留几秒上下文(供"刚才发生了什么"类问题看到问题前的画面)。
+        # tail_margin: 末事件【之后】保留几秒(尾部静默负样本, 教模型"答完继续闭嘴")。
+        #   取值三形态: None -> 0(不留); int -> 固定; (lo,hi) -> 每样本在 [lo,hi] 随机。
+        #   随机窗口(默认 head=(5,15) tail=(0,10))能打散 response 在 clip 内的位置, 防止
+        #   模型学成"沉默 N 秒必开口"的周期性病(见讨论)。时间不足时自动裁到可用范围。
+        #   随机用【每样本确定性种子】(video_path 的 md5), 缓存重建/多 worker 都稳定一致。
+        self.head_margin = head_margin
         self.tail_margin = tail_margin
 
     @staticmethod
@@ -101,6 +110,16 @@ class JoyStreamingVideoPreprocessor(RowPreprocessor):
         elif duration >= 64:
             return 2.0
         return 4.0
+
+    @staticmethod
+    def _sample_margin(rng: random.Random, spec: Union[int, Tuple[int, int], None]) -> int:
+        """把 head/tail_margin 规格解析成一个具体秒数: None->0; int->固定; (lo,hi)->随机。"""
+        if spec is None:
+            return 0
+        if isinstance(spec, (tuple, list)):
+            lo, hi = int(spec[0]), int(spec[1])
+            return lo if hi <= lo else rng.randint(lo, hi)
+        return int(spec)
 
     def preprocess(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         video_path = row.get('video_path') or (row.get('videos') or [None])[0]
@@ -161,14 +180,29 @@ class JoyStreamingVideoPreprocessor(RowPreprocessor):
                 hash_id='joy_stream_all_resp_cut')
             return None
 
-        # 末事件之后的秒全是 </silence>, 没有信息量却按 30 token/秒 + 每秒的帧
-        # 吃满算力。裁到 max(存活事件) + tail_margin。
-        # 必须放在两个 map 建好之后(用存活的事件算), 且 n_seconds 只减不增、
-        # 又保证 >= max(events)+1, 所以不会把任何 map 的 key 甩到范围外。
-        if self.tail_margin is not None:
-            events = list(question_map) + list(response_map)
-            if events:
-                n_seconds = min(n_seconds, max(events) + self.tail_margin + 1)
+        # ---- 事件窗口截断 + 时间轴归零 ----------------------------------------
+        # 窗口 = [首事件 - head, 末事件 + tail], 只保留这段, 秒号重编从 0 开始。
+        #   · 砍掉首事件【之前】的长 lead-in silence(问题还没来, 全是空转) —— 不平衡元凶。
+        #   · 砍掉末事件【之后】的长尾 silence。
+        #   · head/tail 每样本随机(确定性种子), 打散 response 在窗口内的位置, 防周期性开口。
+        #   · 时间不足自动裁到可用范围(window_start>=0, window_end<=n_seconds)。
+        # 必须放在两个 map 建好之后。窗口按绝对秒算, 之后把所有 event 平移 -window_start 重编号。
+        window_start = 0
+        events = sorted(set(question_map) | set(response_map))
+        if events and (self.head_margin is not None or self.tail_margin is not None):
+            seed = int(hashlib.md5(str(video_path).encode('utf-8')).hexdigest()[:8], 16)
+            rng = random.Random(seed)
+            head = self._sample_margin(rng, self.head_margin)
+            tail = self._sample_margin(rng, self.tail_margin)
+            first_ev, last_ev = events[0], events[-1]
+            window_start = max(0, first_ev - head)
+            window_end = min(n_seconds, last_ev + tail + 1)   # 绝对秒; 时间不足则被 n_seconds 夹住
+            # 平移重编号: 绝对秒 t -> 相对秒 t - window_start (窗口按构造覆盖了所有 event)
+            question_map = {t - window_start: c for t, c in question_map.items()
+                            if window_start <= t < window_end}
+            response_map = {t - window_start: c for t, c in response_map.items()
+                            if window_start <= t < window_end}
+            n_seconds = max(window_end - window_start, 1)
 
         messages: List[Dict[str, str]] = []
         for sec in range(n_seconds):
@@ -199,12 +233,16 @@ class JoyStreamingVideoPreprocessor(RowPreprocessor):
                 'stream_n_seconds': n_seconds,
                 'stream_frames_per_sec': frames_per_sec,
                 'stream_max_duration': self.max_duration,
+                # 模板解码要按此偏移分桶: 绝对秒 int(t) - window_start -> 窗口内相对秒。
+                'stream_window_start': window_start,
             },
         }
 
 
 def register_joy_streaming_dataset(dataset_path: str, *, name: str = 'joy_streaming_video',
-                                   max_duration: int = 320, tail_margin: Optional[int] = None,
+                                   max_duration: int = 320,
+                                   head_margin: Union[int, Tuple[int, int], None] = (5, 15),
+                                   tail_margin: Union[int, Tuple[int, int], None] = (0, 10),
                                    video_root: Optional[str] = None,
                                    pattern: str = '**/*.jsonl') -> None:
     """把本地 JoyAI 原始数据注册成可用 `--dataset {name}` 引用的**单个**数据集。
@@ -214,13 +252,14 @@ def register_joy_streaming_dataset(dataset_path: str, *, name: str = 'joy_stream
       - 通配符:     '/path/*.jsonl' 或 '/path/**/*.jsonl'（HF 递归 glob）
       - 目录:       '/path/'  → 自动展开为 '/path/{pattern}'（默认递归所有 .jsonl）
 
-    `max_duration` 时间轴上限(秒); `tail_margin` 末个事件之后只再保留几秒(None=不裁,
-    见 JoyStreamingVideoPreprocessor)。
+    `max_duration` 时间轴上限(秒); `head_margin`/`tail_margin` 事件窗口截断的前/后保留秒数
+    (None=0; int=固定; (lo,hi)=每样本随机; 见 JoyStreamingVideoPreprocessor)。
 
     在 `--custom_register_path your_reg.py` 里调用即可，例如::
 
         from swift.dataset.preprocessor.streaming_video import register_joy_streaming_dataset
-        register_joy_streaming_dataset('/data/joyai/annotations', max_duration=230, tail_margin=10)
+        register_joy_streaming_dataset('/data/joyai/annotations', max_duration=230,
+                                       head_margin=(5, 15), tail_margin=(0, 10))
     """
     import glob as _glob
     from ..dataset_meta import DatasetMeta
@@ -241,7 +280,8 @@ def register_joy_streaming_dataset(dataset_path: str, *, name: str = 'joy_stream
             dataset_path=dataset_path,
             dataset_name=name,
             preprocess_func=JoyStreamingVideoPreprocessor(
-                max_duration=max_duration, tail_margin=tail_margin, video_root=video_root),
+                max_duration=max_duration, head_margin=head_margin, tail_margin=tail_margin,
+                video_root=video_root),
             tags=['video', 'streaming'],
         ),
         exist_ok=True)

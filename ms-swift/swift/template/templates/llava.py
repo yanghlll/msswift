@@ -1087,6 +1087,26 @@ def _log_frame_budget(H: int, W: int, n_per_frame: int, max_pixels) -> None:
           flush=True)
 
 
+# JoyAI-VL-Interaction 官方 streaming system prompt（services/webinfer/live_adapter.py
+# DEFAULT_SYSTEM_PROMPT_EN）精简版：去掉 delegation（我们数据里没有该动作），保留
+# silence/speak 两动作。训练(模板 default_system)与推理(stream_infer.py --system)必须
+# 用【同一句】，否则 train/infer 漂移。改这里 -> 记得同步 stream_infer.py 的默认值。
+STREAMING_SYSTEM_PROMPT = (
+    'You are a real-time video streaming assistant observing a continuous camera feed '
+    'frame by frame. The last frame represents the current moment.\n'
+    '## Action Format\n'
+    'At every inference step you MUST choose exactly one of the following two actions:\n'
+    '**Stay silent** — output ONLY:\n'
+    '</silence>\n'
+    'Choose this when nothing noteworthy has changed in the scene, no user query is '
+    'pending, or there is nothing useful to say.\n'
+    '**Speak** — output the token followed by a concise reply:\n'
+    '</response> Your reply here.\n'
+    'Choose this when you observe something worth reporting or a significant state '
+    'change, or when you can answer a user question based on available evidence.'
+)
+
+
 class LLavaOneVision2StreamingTemplate(LLavaOneVision2Template):
     """Streaming-video-understanding 模板（JoyAI-VL-Interaction 风格）。
 
@@ -1115,8 +1135,13 @@ class LLavaOneVision2StreamingTemplate(LLavaOneVision2Template):
             inputs.videos = videos
 
     def _frames_by_second(self, inputs: StdTemplateInputs, fps: float, n_seconds: int,
-                          frames_per_sec: int):
-        """整段视频 frames-sample 解码 -> 每秒一个视觉文本桶 + (按保留帧切过的)张量。"""
+                          frames_per_sec: int, window_start: int = 0):
+        """整段视频 frames-sample 解码 -> 每秒一个视觉文本桶 + (按保留帧切过的)张量。
+
+        window_start>0 时: 只保留绝对秒落在 [window_start, window_start+n_seconds) 的帧,
+        并按 相对秒 = int(t) - window_start 分桶(与 preprocessor 的时间轴归零对齐)。
+        解码仍从 0 起(video_processor 按 target_fps 从头采样), max_frames 放大到窗口末尾
+        以确保覆盖到 window_end; 窗口前的帧解码后丢弃(不进桶、不进张量)。"""
         if self.video_backend == 'codec':
             raise NotImplementedError('streaming 模板暂只支持 frames 后端；请设 VIDEO_BACKEND=frames')
         processor = self.processor
@@ -1127,7 +1152,8 @@ class LLavaOneVision2StreamingTemplate(LLavaOneVision2Template):
         try:
             vp.fixed_num_frames = None
             vp.target_fps = float(fps)
-            vp.max_frames = int(n_seconds * frames_per_sec)
+            # 采样到窗口末尾(绝对秒 window_start+n_seconds); window_start=0 时退化为原逻辑。
+            vp.max_frames = int((window_start + n_seconds) * frames_per_sec)
             _prof = _prof_on('decode')
             _t0 = _time.perf_counter() if _prof else 0
             video_outputs = vp(videos=list(inputs.videos), return_tensors='pt')
@@ -1150,8 +1176,8 @@ class LLavaOneVision2StreamingTemplate(LLavaOneVision2Template):
         bucket_counts = [0] * n_seconds                        # 每秒保留帧数(桶内容 id 可直接构造)
         keep: List[int] = []
         for i in range(T):
-            sec = int(frame_seconds[i])
-            if sec >= n_seconds:      # 截断超界: 丢弃该帧(不进桶、不保留张量行)
+            sec = int(frame_seconds[i]) - window_start          # 绝对秒 -> 窗口内相对秒
+            if sec < 0 or sec >= n_seconds:   # 窗口外(前 lead-in / 后长尾): 丢弃该帧
                 continue
             bucket_counts[sec] += 1
             keep.append(i)
@@ -1182,12 +1208,14 @@ class LLavaOneVision2StreamingTemplate(LLavaOneVision2Template):
         n_seconds = int(ck['stream_n_seconds'])
         fps = float(ck['stream_fps'])
         frames_per_sec = int(ck.get('stream_frames_per_sec', max(int(fps), 1)))
+        window_start = int(ck.get('stream_window_start', 0))   # 事件窗口截断的绝对起点(秒)
 
         input_ids = encoded['input_ids']
         labels = encoded.get('labels')
         loss_scale = encoded.get('loss_scale')
 
-        bucket_counts, n_per_frame, tensors = self._frames_by_second(inputs, fps, n_seconds, frames_per_sec)
+        bucket_counts, n_per_frame, tensors = self._frames_by_second(
+            inputs, fps, n_seconds, frames_per_sec, window_start)
 
         idx_list = findall(input_ids, self.video_token_id)
         assert len(idx_list) == n_seconds == len(bucket_counts), (
@@ -1270,5 +1298,6 @@ register_template(
     QwenTemplateMeta(
         MLLMTemplateType.llava_onevision2_streaming,
         template_cls=LLavaOneVision2StreamingTemplate,
+        default_system=STREAMING_SYSTEM_PROMPT,  # 专属 streaming prompt(非通用 "helpful assistant")
         agent_template=None,
     ))
